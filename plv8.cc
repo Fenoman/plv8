@@ -66,6 +66,16 @@ PG_FUNCTION_INFO_V1(plv8_inline_handler);
 
 using namespace v8;
 
+static inline TransactionId
+plv8_heap_tuple_get_xmin(HeapTuple tuple)
+{
+#ifdef HeapTupleGetXmin
+	return HeapTupleGetXmin(tuple);
+#else
+	return HeapTupleHeaderGetXmin(tuple->t_data);
+#endif
+}
+
 typedef struct plv8_proc_cache
 {
 	Oid						fn_oid;
@@ -1264,7 +1274,7 @@ plv8_get_proc(Oid fn_oid, FunctionCallInfo fcinfo, bool validate, char ***argnam
 		 * we can expect this doesn't affect runtime performance.
 		 */
 		uptodate = (!cache->function.IsEmpty() &&
-			cache->fn_xmin == HeapTupleHeaderGetXmin(procTup->t_data) &&
+			cache->fn_xmin == plv8_heap_tuple_get_xmin(procTup) &&
 			ItemPointerEquals(&cache->fn_tid, &procTup->t_self) &&
 			cache->user_id == GetUserId());
 
@@ -1302,7 +1312,7 @@ plv8_get_proc(Oid fn_oid, FunctionCallInfo fcinfo, bool validate, char ***argnam
 		cache->rettype = procStruct->prorettype;
 
 		strlcpy(cache->proname, NameStr(procStruct->proname), NAMEDATALEN);
-		cache->fn_xmin = HeapTupleHeaderGetXmin(procTup->t_data);
+		cache->fn_xmin = plv8_heap_tuple_get_xmin(procTup);
 		cache->fn_tid = procTup->t_self;
 		cache->user_id = GetUserId();
 
