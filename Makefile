@@ -47,7 +47,7 @@ deps/v8-cmake/README.md:
 	$(foreach patch,$(PATCH_V8),cd deps/v8-cmake && patch -p1 <../../$(patch);)
 
 deps/v8-cmake/build/libv8_libbase.a: deps/v8-cmake/README.md
-	@cd deps/v8-cmake && mkdir -p build && cd build && cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Denable-fPIC=ON -DCMAKE_BUILD_TYPE=Release ../ && make -j $(NUMPROC)
+	@cd deps/v8-cmake && mkdir -p build && cd build && cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Denable-fPIC=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE=-O0 -DCMAKE_CXX_FLAGS_RELEASE=-O0 ../ && make -j $(NUMPROC)
 
 v8: deps/v8-cmake/build/libv8_libbase.a
 
@@ -96,7 +96,7 @@ plv8_config.h: plv8_config.h.in Makefile
 
 COMPILE.cxx.bc = $(CLANG) -xc++ -Wno-ignored-attributes $(BITCODE_CXXFLAGS) $(CCFLAGS) $(CPPFLAGS) -emit-llvm -c
 
-%.bc : %.cc
+%.bc : %.cc plv8_config.h plv8.h
 	$(COMPILE.cxx.bc) $(CCFLAGS) $(CPPFLAGS) -fPIC -c -o $@ $<
 	$(LLVM_BINPATH)/opt -module-summary -f $@ -o $@
 
