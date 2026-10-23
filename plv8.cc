@@ -76,10 +76,18 @@ PG_FUNCTION_INFO_V1(plv8_inline_handler);
 
 using namespace v8;
 
+/*
+ * Tantor uses 64-bit xids and keeps xmin in HeapTupleData, where
+ * HeapTupleGetXmin() reads it. Community PostgreSQL reads it from the tuple
+ * header with HeapTupleHeaderGetXmin(). Tantor 17 defines the accessor as a
+ * macro and Tantor 18 as a static inline function, so the macro test alone
+ * misses Tantor 18. TANTOR_VERSION comes from pg_config.h and is set by every
+ * Tantor edition, unlike the -DTANTOR_SE and -DTANTOR_SE1C edition flags.
+ */
 static inline TransactionId
 plv8_heap_tuple_get_xmin(HeapTuple tuple)
 {
-#ifdef HeapTupleGetXmin
+#if defined(HeapTupleGetXmin) || defined(TANTOR_VERSION)
 	return HeapTupleGetXmin(tuple);
 #else
 	return HeapTupleHeaderGetXmin(tuple->t_data);
