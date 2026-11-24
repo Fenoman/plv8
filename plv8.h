@@ -196,6 +196,40 @@ public:
 };
 
 /*
+ * Returns the plv8 object of the context, or an empty handle when the global
+ * "plv8" does not refer to it.  Scripts can reassign the global, and internal
+ * fields must not be read or written on any other object.
+ */
+static inline v8::Local<v8::Object>
+plv8_GetPlv8Object(v8::Local<v8::Context> context)
+{
+	v8::Local<v8::Value>	plv8_value;
+	/*
+	 * A getter on the global can throw.  Drop that exception, the caller
+	 * reports a missing plv8 object, but let termination pass on.
+	 */
+	v8::TryCatch			try_catch(context->GetIsolate());
+
+	if (!context->Global()->Get(context, v8::String::NewFromUtf8Literal(
+				context->GetIsolate(),
+				"plv8",
+				v8::NewStringType::kInternalized)).ToLocal(&plv8_value))
+	{
+		if (try_catch.HasTerminated())
+			try_catch.ReThrow();
+		return v8::Local<v8::Object>();
+	}
+	if (!plv8_value->IsObject())
+		return v8::Local<v8::Object>();
+
+	v8::Local<v8::Object>	plv8_obj = v8::Local<v8::Object>::Cast(plv8_value);
+
+	if (plv8_obj->InternalFieldCount() != PLV8_INTNL_MAX)
+		return v8::Local<v8::Object>();
+	return plv8_obj;
+}
+
+/*
  * Check if this is a window function call.  If so, we store fcinfo
  * in plv8 object for API to use it.  It would be possible to do it
  * in the normal function cases, but currently nobody is using it
@@ -208,19 +242,16 @@ private:
 	WindowObject			m_winobj;
 	v8::Handle<v8::Object>	m_plv8obj;
 	v8::Handle<v8::Value>	m_prev_fcinfo;
+	bool					m_restored;
 
 public:
 	WindowFunctionSupport(v8::Handle<v8::Context> context,
-						FunctionCallInfo fcinfo)
+						FunctionCallInfo fcinfo) : m_restored(false)
 	{
 		m_winobj = PG_WINDOW_OBJECT();
 		if (WindowObjectIsValid(m_winobj))
 		{
-			m_plv8obj = v8::Handle<v8::Object>::Cast(
-					context->Global()->Get(context, v8::String::NewFromUtf8Literal(
-						context->GetIsolate(),
-						"plv8",
-						v8::NewStringType::kInternalized)).ToLocalChecked());
+			m_plv8obj = plv8_GetPlv8Object(context);
 			if (m_plv8obj.IsEmpty())
 				throw js_error("plv8 object not found");
 			/* Stash the current item, just in case of nested call */
@@ -231,13 +262,21 @@ public:
 	}
 	bool IsWindowCall() { return WindowObjectIsValid(m_winobj); }
 	WindowObject GetWindowObject() { return m_winobj; }
-	~WindowFunctionSupport()
+	/*
+	 * Restore the previous fcinfo if we saved.  Callers also run this before
+	 * passing on a PostgreSQL error, which jumps over the destructor.
+	 */
+	void Restore()
 	{
-		/* Restore the previous fcinfo if we saved. */
-		if (WindowObjectIsValid(m_winobj))
+		if (WindowObjectIsValid(m_winobj) && !m_restored)
 		{
 			m_plv8obj->SetInternalField(PLV8_INTNL_FCINFO, m_prev_fcinfo);
+			m_restored = true;
 		}
+	}
+	~WindowFunctionSupport()
+	{
+		Restore();
 	}
 };
 
@@ -251,18 +290,15 @@ class SRFSupport
 private:
 	v8::Handle<v8::Object> m_plv8obj;
 	v8::Handle<v8::Value> m_prev_conv, m_prev_tupstore;
+	bool m_restored;
 
 public:
 	SRFSupport(v8::Handle<v8::Context> context,
-			   Converter *conv, Tuplestorestate *tupstore)
+			   Converter *conv, Tuplestorestate *tupstore) : m_restored(false)
 	{
-	    v8::Local<v8::Value> m_val;
-	    if (!context->Global()->Get(context, v8::String::NewFromUtf8Literal(
-                context->GetIsolate(),
-                "plv8",
-                v8::NewStringType::kInternalized)).ToLocal(&m_val))
-            throw js_error("plv8 object not found");
-	    m_plv8obj = v8::Handle<v8::Object>::Cast(m_val);
+		m_plv8obj = plv8_GetPlv8Object(context);
+		if (m_plv8obj.IsEmpty())
+			throw js_error("plv8 object not found");
 		m_prev_conv = m_plv8obj->GetInternalField(PLV8_INTNL_CONV);
 		m_prev_tupstore = m_plv8obj->GetInternalField(PLV8_INTNL_TUPSTORE);
 		m_plv8obj->SetInternalField(PLV8_INTNL_CONV,
@@ -270,11 +306,21 @@ public:
 		m_plv8obj->SetInternalField(PLV8_INTNL_TUPSTORE,
 									v8::External::New(context->GetIsolate(), tupstore));
 	}
-	~SRFSupport()
+	/*
+	 * Restore the previous items.  Callers also run this before passing on a
+	 * PostgreSQL error, which jumps over the destructor.
+	 */
+	void Restore()
 	{
-		/* Restore the previous items. */
+		if (m_restored)
+			return;
 		m_plv8obj->SetInternalField(PLV8_INTNL_CONV, m_prev_conv);
 		m_plv8obj->SetInternalField(PLV8_INTNL_TUPSTORE, m_prev_tupstore);
+		m_restored = true;
+	}
+	~SRFSupport()
+	{
+		Restore();
 	}
 };
 

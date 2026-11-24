@@ -40,6 +40,45 @@ static Datum EpochToTimestampTz(double epoch);
 static double DateToEpoch(DateADT date);
 static Datum EpochToDate(double epoch);
 
+/*
+ * Conversions run with V8 frames on the stack and with the window and
+ * set-returning call state stored in the plv8 object.  A PostgreSQL error
+ * raised here must leave as a C++ exception, never by jumping over them.
+ */
+static Datum
+plv8_DirectCall1(PGFunction func, Datum arg1)
+{
+	Datum	result = (Datum) 0;
+
+	PG_TRY();
+	{
+		result = DirectFunctionCall1(func, arg1);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static Datum
+plv8_DirectCall3(PGFunction func, Datum arg1, Datum arg2, Datum arg3)
+{
+	Datum	result = (Datum) 0;
+
+	PG_TRY();
+	{
+		result = DirectFunctionCall3(func, arg1, arg2, arg3);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+	return result;
+}
+
 void
 plv8_fill_type(plv8_type *type, Oid typid, MemoryContext mcxt)
 {
@@ -167,7 +206,7 @@ GetJsonbValue(JsonbValue *scalarVal) {
     /* The string is length-delimited; pass the length rather than copying it to the stack. */
 		return Local<v8::Value>::New(isolate, v8::String::NewFromUtf8(isolate, scalarVal->val.string.val, v8::NewStringType::kNormal, scalarVal->val.string.len).ToLocalChecked());
   } else if (scalarVal->type == jbvNumeric) {
-		return Local<v8::Value>::New(isolate, Number::New(isolate, DatumGetFloat8(DirectFunctionCall1(numeric_float8, PointerGetDatum(scalarVal->val.numeric)))));
+		return Local<v8::Value>::New(isolate, Number::New(isolate, DatumGetFloat8(plv8_DirectCall1(numeric_float8, PointerGetDatum(scalarVal->val.numeric)))));
   } else if (scalarVal->type == jbvBool) {
 		return Local<v8::Value>::New(isolate, v8::Boolean::New(isolate, scalarVal->val.boolean));
   } else {
@@ -266,6 +305,40 @@ ConvertJsonb(JsonbContainer *in) {
 
 	return JsonbIterate(&it, container);
 }
+
+/* pushJsonbValue() raises errors for oversized values, see plv8_DirectCall1(). */
+#if PG_VERSION_NUM >= 190000
+static void
+plv8_PushJsonbValue(JsonbInState *pstate, JsonbIteratorToken seq, JsonbValue *val)
+{
+	PG_TRY();
+	{
+		pushJsonbValue(pstate, seq, val);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+}
+#else
+static JsonbValue *
+plv8_PushJsonbValue(JsonbParseState **pstate, JsonbIteratorToken seq, JsonbValue *val)
+{
+	JsonbValue *result = NULL;
+
+	PG_TRY();
+	{
+		result = pushJsonbValue(pstate, seq, val);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+	return result;
+}
+#endif
 
 #if PG_VERSION_NUM >= 190000
 static JsonbValue *
@@ -465,7 +538,7 @@ JsonbFromValue(JsonbParseState **pstate, Local<v8::Value> value, JsonbIteratorTo
 			} else {
 				float8 fv = (float8) value->NumberValue(context).ToChecked();
 
-				val.val.numeric = DatumGetNumeric(DirectFunctionCall1(float8_numeric, Float8GetDatum(fv)));
+				val.val.numeric = DatumGetNumeric(plv8_DirectCall1(float8_numeric, Float8GetDatum(fv)));
 				val.type = jbvNumeric;
 			}
 		} else if (value->IsDate()) {
@@ -487,10 +560,10 @@ JsonbFromValue(JsonbParseState **pstate, Local<v8::Value> value, JsonbIteratorTo
 	}
 
 #if PG_VERSION_NUM >= 190000
-	pushJsonbValue(pstate, type, &val);
+	plv8_PushJsonbValue(pstate, type, &val);
 	return pstate->result;
 #else
-	return pushJsonbValue(pstate, type, &val);
+	return plv8_PushJsonbValue(pstate, type, &val);
 #endif
 }
 
@@ -503,10 +576,10 @@ JsonbArrayFromArray(JsonbParseState **pstate, Local<v8::Object> object) {
 	Isolate *isolate = Isolate::GetCurrent();
 	Local<Context>		context = isolate->GetCurrentContext();
 #if PG_VERSION_NUM >= 190000
-	pushJsonbValue(pstate, WJB_BEGIN_ARRAY, NULL);
+	plv8_PushJsonbValue(pstate, WJB_BEGIN_ARRAY, NULL);
 	JsonbValue *val = pstate->result;
 #else
-	JsonbValue *val = pushJsonbValue(pstate, WJB_BEGIN_ARRAY, NULL);
+	JsonbValue *val = plv8_PushJsonbValue(pstate, WJB_BEGIN_ARRAY, NULL);
 #endif
 	Local<v8::Array> a = Local<v8::Array>::Cast(object);
 	for (size_t i = 0; i < a->Length(); i++) {
@@ -522,10 +595,10 @@ JsonbArrayFromArray(JsonbParseState **pstate, Local<v8::Object> object) {
 	}
 
 #if PG_VERSION_NUM >= 190000
-	pushJsonbValue(pstate, WJB_END_ARRAY, NULL);
+	plv8_PushJsonbValue(pstate, WJB_END_ARRAY, NULL);
 	val = pstate->result;
 #else
-	val = pushJsonbValue(pstate, WJB_END_ARRAY, NULL);
+	val = plv8_PushJsonbValue(pstate, WJB_END_ARRAY, NULL);
 #endif
 
 	return val;
@@ -540,10 +613,10 @@ JsonbObjectFromObject(JsonbParseState **pstate, Local<v8::Object> object) {
 	Isolate *isolate = Isolate::GetCurrent();
 	Local<Context>		context = isolate->GetCurrentContext();
 #if PG_VERSION_NUM >= 190000
-	pushJsonbValue(pstate, WJB_BEGIN_OBJECT, NULL);
+	plv8_PushJsonbValue(pstate, WJB_BEGIN_OBJECT, NULL);
 	JsonbValue *val = pstate->result;
 #else
-	JsonbValue *val = pushJsonbValue(pstate, WJB_BEGIN_OBJECT, NULL);
+	JsonbValue *val = plv8_PushJsonbValue(pstate, WJB_BEGIN_OBJECT, NULL);
 #endif
 	Local<Array> arr = object->GetOwnPropertyNames(context).ToLocalChecked();
 
@@ -563,10 +636,10 @@ JsonbObjectFromObject(JsonbParseState **pstate, Local<v8::Object> object) {
 		}
 	}
 #if PG_VERSION_NUM >= 190000
-	pushJsonbValue(pstate, WJB_END_OBJECT, NULL);
+	plv8_PushJsonbValue(pstate, WJB_END_OBJECT, NULL);
 	val = pstate->result;
 #else
-	val = pushJsonbValue(pstate, WJB_END_OBJECT, NULL);
+	val = plv8_PushJsonbValue(pstate, WJB_END_OBJECT, NULL);
 #endif
 	return val;
 }
@@ -588,27 +661,44 @@ ConvertObject(Local<v8::Object> object) {
 #else
   JsonbParseState *pstate = NULL;
 #endif
-  JsonbValue *val;
+  JsonbValue *val = NULL;
 
+	/* A conversion error can be caught by the script, so clean up here. */
+	try {
 	if (object->IsArray()) {
 		val = JsonbArrayFromArray(&pstate, object);
 	} else if (object->IsObject()) {
 		val = JsonbObjectFromObject(&pstate, object);
 	} else {
-		pushJsonbValue(&pstate, WJB_BEGIN_ARRAY, NULL);
+		plv8_PushJsonbValue(&pstate, WJB_BEGIN_ARRAY, NULL);
 		JsonbFromValue(&pstate, object, WJB_ELEM);
 #if PG_VERSION_NUM >= 190000
-		pushJsonbValue(&pstate, WJB_END_ARRAY, NULL);
+		plv8_PushJsonbValue(&pstate, WJB_END_ARRAY, NULL);
 		val = pstate.result;
 #else
-		val = pushJsonbValue(&pstate, WJB_END_ARRAY, NULL);
+		val = plv8_PushJsonbValue(&pstate, WJB_END_ARRAY, NULL);
 #endif
                 val->val.array.rawScalar = true;
+	}
+	} catch (...) {
+		MemoryContextSwitchTo(oldcontext);
+		MemoryContextDelete(conversion_context);
+		throw;
 	}
 
 	MemoryContextSwitchTo(oldcontext);
 
-	Jsonb *ret = JsonbValueToJsonb(val);
+	Jsonb *ret = NULL;
+	PG_TRY();
+	{
+		ret = JsonbValueToJsonb(val);
+	}
+	PG_CATCH();
+	{
+		MemoryContextDelete(conversion_context);
+		throw pg_error();
+	}
+	PG_END_TRY();
 	MemoryContextDelete(conversion_context);
   return ret;
 }
@@ -750,7 +840,7 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 	case INT2OID:
 		if (value->IsNumber())
 #ifdef CHECK_INTEGER_OVERFLOW
-			return DirectFunctionCall1(int82,
+			return plv8_DirectCall1(int82,
 					Int64GetDatum(value->IntegerValue()));
 #else
 			return Int16GetDatum((int16) value->Int32Value(isolate->GetCurrentContext()).ToChecked());
@@ -759,7 +849,7 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 	case INT4OID:
 		if (value->IsNumber())
 #ifdef CHECK_INTEGER_OVERFLOW
-			return DirectFunctionCall1(int84,
+			return plv8_DirectCall1(int84,
 					Int64GetDatum(value->IntegerValue()));
 #else
 			return Int32GetDatum((int32) value->Int32Value(isolate->GetCurrentContext()).ToChecked());
@@ -784,10 +874,10 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 	case NUMERICOID:
 		if (value->IsBigInt()) {
 			v8::String::Utf8Value utf8(isolate, value->ToString(isolate->GetCurrentContext()).ToLocalChecked());
-			return DirectFunctionCall3(numeric_in, (Datum) *utf8, ObjectIdGetDatum(InvalidOid), Int32GetDatum((int32) -1));
+			return plv8_DirectCall3(numeric_in, (Datum) *utf8, ObjectIdGetDatum(InvalidOid), Int32GetDatum((int32) -1));
 		}
 		if (value->IsNumber())
-			return DirectFunctionCall1(float8_numeric,
+			return plv8_DirectCall1(float8_numeric,
 					Float8GetDatum((float8) value->NumberValue(isolate->GetCurrentContext()).ToChecked()));
 		break;
 	case DATEOID:
@@ -848,7 +938,7 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 			Handle<v8::Value> result = JSON.Stringify(value);
 			CString str(result);
 
-			return (Datum) DatumGetJsonbP(DirectFunctionCall1(jsonb_in, (Datum) (char *) str));
+			return (Datum) DatumGetJsonbP(plv8_DirectCall1(jsonb_in, (Datum) (char *) str));
 		}
 #endif // JSONB_DIRECT_CONVERSION
 		break;
@@ -937,9 +1027,30 @@ ToArrayDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 		throw js_error("value is not an Array");
 
 	length = array->Length();
-	values = (Datum *) palloc(sizeof(Datum) * length);
-	nulls = (bool *) palloc(sizeof(bool) * length);
+	/* A long array exceeds the allocation limit. */
+	PG_TRY();
+	{
+		values = (Datum *) palloc(sizeof(Datum) * length);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+	PG_TRY();
+	{
+		nulls = (bool *) palloc(sizeof(bool) * length);
+	}
+	PG_CATCH();
+	{
+		pfree(values);
+		throw pg_error();
+	}
+	PG_END_TRY();
 	ndims[0] = length;
+	/* The script can catch a conversion error, free the work arrays anyway. */
+	try
+	{
 	for (int i = 0; i < length; i++) {
 		if (type->is_composite)
 		{
@@ -949,8 +1060,23 @@ ToArrayDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 		}
 	}
 
-	result = construct_md_array(values, nulls, 1, ndims, lbs,
-				type->typid, type->len, type->byval, type->align);
+	PG_TRY();
+	{
+		result = construct_md_array(values, nulls, 1, ndims, lbs,
+					type->typid, type->len, type->byval, type->align);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+	}
+	catch (...)
+	{
+		pfree(values);
+		pfree(nulls);
+		throw;
+	}
 	pfree(values);
 	pfree(nulls);
 
@@ -985,9 +1111,19 @@ ToRecordDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type, TupleDesc 
 	}
 	PG_END_TRY();
 
-	Converter	conv(tupdesc);
+	/* The script can catch a conversion error, release the tupdesc anyway. */
+	try
+	{
+		Converter	conv(tupdesc);
 
-	result = conv.ToDatum(value);
+		result = conv.ToDatum(value);
+	}
+	catch (...)
+	{
+		if (cleanup_tupdesc)
+			ReleaseTupleDesc(tupdesc);
+		throw;
+	}
 
 	if (cleanup_tupdesc)
 	  ReleaseTupleDesc(tupdesc);
@@ -1041,7 +1177,7 @@ ToScalarValue(Datum datum, bool isnull, plv8_type *type)
 		return Number::New(isolate, DatumGetFloat8(datum));
 	case NUMERICOID:
 		return Number::New(isolate, DatumGetFloat8(
-			DirectFunctionCall1(numeric_float8, datum)));
+			plv8_DirectCall1(numeric_float8, datum)));
 	case DATEOID:
 		return Date::New(isolate->GetCurrentContext(), DateToEpoch(DatumGetDateADT(datum))).ToLocalChecked();
 	case TIMESTAMPOID:
@@ -1165,8 +1301,18 @@ ToArrayValue(Datum datum, bool isnull, plv8_type *type)
 	get_type_category_preferred(base.typid, &(base.category), &ispreferred);
 	get_typlenbyvalalign(base.typid, &(base.len), &(base.byval), &(base.align));
 
-	for (int i = 0; i < nelems; i++)
-		result->Set(context, i, ToValue(values[i], nulls[i], &base)).Check();
+	/* The script can catch a conversion error, free the arrays anyway. */
+	try
+	{
+		for (int i = 0; i < nelems; i++)
+			result->Set(context, i, ToValue(values[i], nulls[i], &base)).Check();
+	}
+	catch (...)
+	{
+		pfree(values);
+		pfree(nulls);
+		throw;
+	}
 
 	pfree(values);
 	pfree(nulls);
@@ -1196,15 +1342,26 @@ ToRecordValue(Datum datum, bool isnull, plv8_type *type)
 	}
 	PG_END_TRY();
 
-	Converter	conv(tupdesc);
-
 	/* Build a temporary HeapTuple control structure */
 	tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
 	ItemPointerSetInvalid(&(tuple.t_self));
 	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = rec;
 
-	Local<v8::Value> result = conv.ToValue(&tuple);
+	Local<v8::Value> result;
+
+	/* The script can catch a conversion error, release the tupdesc anyway. */
+	try
+	{
+		Converter	conv(tupdesc);
+
+		result = conv.ToValue(&tuple);
+	}
+	catch (...)
+	{
+		ReleaseTupleDesc(tupdesc);
+		throw;
+	}
 
 	ReleaseTupleDesc(tupdesc);
 

@@ -256,3 +256,72 @@ SELECT i, win_argno_current(i) OVER () FROM generate_series(1,3) i;
 SELECT i, win_argno_neg(i) OVER () FROM generate_series(1,3) i;
 SELECT i, win_argno_part(i) OVER () FROM generate_series(1,3) i;
 SELECT i, win_argno_frame(i) OVER () FROM generate_series(1,3) i;
+
+-- Window methods reject receivers with missing or incompatible internal fields.
+CREATE FUNCTION win_bad_this(kind text) RETURNS int AS $$
+  var w = plv8.get_window_object();
+  kind = w.get_func_arg_current(0);
+  var plan = plv8.prepare('SELECT 1');
+  var cursor = plan.cursor();
+  var receivers = {plain: {}, plv8: plv8, function: this, plan: plan, cursor: cursor};
+  var methods = ['get_partition_local', 'set_partition_local',
+    'get_current_position', 'get_partition_row_count', 'set_mark_position',
+    'rows_are_peers', 'get_func_arg_in_partition', 'get_func_arg_in_frame',
+    'get_func_arg_current'];
+  var rejected = 0;
+  try {
+    for (var method of methods) {
+      try {
+        w[method].apply(receivers[kind], [0, 0, w.SEEK_CURRENT, false]);
+      } catch (e) {
+        if (e.message !== 'window function api called with wrong object') throw e;
+        rejected++;
+      }
+    }
+  } finally {
+    cursor.close();
+    plan.free();
+  }
+  return rejected;
+$$ LANGUAGE plv8 WINDOW;
+
+SELECT kind, win_bad_this(kind) OVER () FROM
+  (VALUES ('plain'), ('plv8'), ('function'), ('plan'), ('cursor')) AS t(kind);
+
+CREATE FUNCTION win_bad_factory() RETURNS void AS $$
+  plv8.get_window_object.call({});
+$$ LANGUAGE plv8;
+SELECT win_bad_factory();
+
+-- A window object kept after its call is rejected outside a window function
+-- call, one kept between rows of the same query keeps working.
+CREATE FUNCTION win_keep() RETURNS int AS $$
+  globalThis.kept_window = plv8.get_window_object();
+  return 1;
+$$ LANGUAGE plv8 WINDOW;
+CREATE FUNCTION win_kept_plain() RETURNS int AS $$
+  return globalThis.kept_window.get_partition_row_count();
+$$ LANGUAGE plv8;
+SELECT win_keep() OVER () FROM generate_series(1, 1);
+SELECT win_kept_plain();
+CREATE FUNCTION win_cached() RETURNS int AS $$
+  if (globalThis.cached_window === undefined)
+    globalThis.cached_window = plv8.get_window_object();
+  return globalThis.cached_window.get_current_position();
+$$ LANGUAGE plv8 WINDOW;
+SELECT win_cached() OVER () FROM generate_series(1, 3);
+-- An error while evaluating a window function argument restores the plv8
+-- object, so the window object kept on the first row is rejected afterwards.
+CREATE FUNCTION win_keep_arg(n int) RETURNS int AS $$
+  globalThis.kept_window = plv8.get_window_object();
+  return n;
+$$ LANGUAGE plv8 WINDOW;
+SELECT win_keep_arg(10 / (2 - i)) OVER () FROM generate_series(1, 2) i;
+SELECT win_kept_plain();
+-- An error converting the result restores the plv8 object as well.
+CREATE FUNCTION win_keep_big() RETURNS numeric AS $$
+  globalThis.kept_window = plv8.get_window_object();
+  return 10n ** 140000n;
+$$ LANGUAGE plv8 WINDOW;
+SELECT win_keep_big() OVER () FROM generate_series(1, 1);
+SELECT win_kept_plain();

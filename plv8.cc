@@ -37,6 +37,7 @@ extern "C" {
 #include "utils/hsearch.h"
 #endif
 
+#include <exception>
 #include <signal.h>
 
 #ifdef EXECUTION_TIMEOUT
@@ -939,7 +940,10 @@ CallFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 		!castNode(CallContext, fcinfo->context)->atomic;
 
 	WindowFunctionSupport support(context, fcinfo);
+	Datum				ret = (Datum) 0;
+	std::exception_ptr	cxx_error;
 
+	auto call = [&]() -> Datum {
 	/*
 	 * In window function case, we cannot see the argument datum
 	 * in fcinfo.  Instead, get them by WinGetFuncArgCurrent().
@@ -949,8 +953,23 @@ CallFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 		WindowObject winobj = support.GetWindowObject();
 		for (int i = 0; i < nargs; i++)
 		{
-			bool isnull;
-			Datum arg = WinGetFuncArgCurrent(winobj, i, &isnull);
+			bool isnull = false;
+			Datum arg = (Datum) 0;
+
+			/*
+			 * Evaluating the argument can raise an error.  Turn it into a C++
+			 * exception so that the destructor of support restores fcinfo in
+			 * the plv8 object.
+			 */
+			PG_TRY();
+			{
+				arg = WinGetFuncArgCurrent(winobj, i, &isnull);
+			}
+			PG_CATCH();
+			{
+				throw pg_error();
+			}
+			PG_END_TRY();
 			args[i] = ToValue(arg, isnull, &argtypes[i]);
 		}
 	}
@@ -987,6 +1006,34 @@ CallFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
     else
       PG_RETURN_VOID( );
   }
+	};
+
+	/*
+	 * A PostgreSQL error raised during the call jumps over the destructor of
+	 * support.  Put the previous fcinfo back before passing the error on.
+	 * C++ exceptions leave the PG_TRY block only after PG_END_TRY.
+	 */
+	PG_TRY();
+	{
+		try
+		{
+			ret = call();
+		}
+		catch (...)
+		{
+			cxx_error = std::current_exception();
+		}
+	}
+	PG_CATCH();
+	{
+		support.Restore();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (cxx_error)
+		std::rethrow_exception(cxx_error);
+	return ret;
 }
 
 static Tuplestorestate *
@@ -1073,7 +1120,9 @@ CallSRFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 	 * for the previous SRF.
 	 */
 	SRFSupport support(context, &conv, tupstore);
+	std::exception_ptr	cxx_error;
 
+	auto call = [&]() {
 	for (int i = 0; i < nargs; i++) {
 		args[i] = ToValue(fcinfo->args[i].value, fcinfo->args[i].isnull, &argtypes[i]);
 	}
@@ -1101,7 +1150,33 @@ CallSRFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 		// return a record or a scalar
 		conv.ToDatum(result, tupstore);
 	}
+	};
 
+	/*
+	 * A PostgreSQL error raised during the call jumps over the destructor of
+	 * support.  Put the previous converter back before passing the error on.
+	 * C++ exceptions leave the PG_TRY block only after PG_END_TRY.
+	 */
+	PG_TRY();
+	{
+		try
+		{
+			call();
+		}
+		catch (...)
+		{
+			cxx_error = std::current_exception();
+		}
+	}
+	PG_CATCH();
+	{
+		support.Restore();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (cxx_error)
+		std::rethrow_exception(cxx_error);
 	return (Datum) 0;
 }
 
@@ -2145,6 +2220,9 @@ Converter::ToDatum(Handle<v8::Value> value, Tuplestorestate *tupstore)
 	Datum  *values = (Datum *) palloc(sizeof(Datum) * m_tupdesc->natts);
 	bool   *nulls = (bool *) palloc(sizeof(bool) * m_tupdesc->natts);
 
+	/* The script can catch a conversion error, free the work arrays anyway. */
+	try
+	{
 	if (!m_is_scalar)
 	{
 		Handle<Array> names = obj->GetPropertyNames(isolate->GetCurrentContext()).ToLocalChecked();
@@ -2186,14 +2264,29 @@ Converter::ToDatum(Handle<v8::Value> value, Tuplestorestate *tupstore)
 			values[c] = ::ToDatum(attr, &nulls[c], &m_coltypes[c]);
 	}
 
-	if (tupstore)
+	PG_TRY();
 	{
-		tuplestore_putvalues(tupstore, m_tupdesc, values, nulls);
-		result = (Datum) 0;
+		if (tupstore)
+		{
+			tuplestore_putvalues(tupstore, m_tupdesc, values, nulls);
+			result = (Datum) 0;
+		}
+		else
+		{
+			result = HeapTupleGetDatum(heap_form_tuple(m_tupdesc, values, nulls));
+		}
 	}
-	else
+	PG_CATCH();
 	{
-		result = HeapTupleGetDatum(heap_form_tuple(m_tupdesc, values, nulls));
+		throw pg_error();
+	}
+	PG_END_TRY();
+	}
+	catch (...)
+	{
+		pfree(values);
+		pfree(nulls);
+		throw;
 	}
 
 	pfree(values);

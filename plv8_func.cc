@@ -440,7 +440,16 @@ plv8_Elog(const FunctionCallbackInfo<v8::Value>& args)
 
 	if (elevel != ERROR)
 	{
-		elog(elevel, "%s", message);
+		/* Sending the message can fail, for example on client encoding. */
+		PG_TRY();
+		{
+			elog(elevel, "%s", message);
+		}
+		PG_CATCH();
+		{
+			throw pg_error();
+		}
+		PG_END_TRY();
 		args.GetReturnValue().Set(Undefined(isolate));
 		return;
 	}
@@ -467,7 +476,7 @@ plv8_Elog(const FunctionCallbackInfo<v8::Value>& args)
 }
 
 static Datum
-value_get_datum(Handle<v8::Value> value, Oid typid, char *isnull)
+value_get_datum_cxx(Handle<v8::Value> value, Oid typid, char *isnull)
 {
 	if (value->IsUndefined() || value->IsNull())
 	{
@@ -481,15 +490,28 @@ value_get_datum(Handle<v8::Value> value, Oid typid, char *isnull)
 		Datum		datum;
 
 		plv8_fill_type(&typinfo, typid);
-		try
-		{
-			datum = ToDatum(value, &IsNull, &typinfo);
-		}
-		catch (js_error& e){ e.rethrow(); }
-		catch (pg_error& e){ e.rethrow(); }
+		datum = ToDatum(value, &IsNull, &typinfo);
 		*isnull = (IsNull ?  'n' : ' ');
 		return datum;
 	}
+}
+
+/*
+ * Same as value_get_datum_cxx(), for callers inside PG_TRY: a conversion
+ * error is reported with ereport() instead of a C++ exception.
+ */
+static Datum
+value_get_datum(Handle<v8::Value> value, Oid typid, char *isnull)
+{
+	Datum		datum = (Datum) 0;
+
+	try
+	{
+		datum = value_get_datum_cxx(value, typid, isnull);
+	}
+	catch (js_error& e){ e.rethrow(); }
+	catch (pg_error& e){ e.rethrow(); }
+	return datum;
 }
 
 static int
@@ -614,7 +636,16 @@ plv8_Prepare(const FunctionCallbackInfo<v8::Value> &args)
 		else /* Consume trailing elements as an array. */
 			array = convertArgsToArray(args, 1, 0);
 		arraylen = array->Length();
-		types = (Oid *) palloc(sizeof(Oid) * arraylen);
+		/* A sparse array can be longer than the allocation limit. */
+		PG_TRY();
+		{
+			types = (Oid *) palloc(sizeof(Oid) * arraylen);
+		}
+		PG_CATCH();
+		{
+			throw pg_error();
+		}
+		PG_END_TRY();
 	}
 
 	for (int i = 0; i < arraylen; i++)
@@ -622,11 +653,21 @@ plv8_Prepare(const FunctionCallbackInfo<v8::Value> &args)
 		CString			typestr(array->Get(context, i).ToLocalChecked());
 		int32			typemod;
 
+		PG_TRY();
+		{
 #if PG_VERSION_NUM >= 160000
-		parseTypeString(typestr, &types[i], &typemod, NULL);
+			parseTypeString(typestr, &types[i], &typemod, NULL);
 #else
-		parseTypeString(typestr, &types[i], &typemod, false);
+			parseTypeString(typestr, &types[i], &typemod, false);
 #endif
+		}
+		PG_CATCH();
+		{
+			/* The script can catch the error, free the type array. */
+			pfree(types);
+			throw pg_error();
+		}
+		PG_END_TRY();
 	}
 
 	PG_TRY();
@@ -762,7 +803,17 @@ plv8_PlanCursor(const FunctionCallbackInfo<v8::Value> &args)
 		else
 			typid = SPI_getargtypeid(plan, i);
 
-		values[i] = value_get_datum(param, typid, &nulls[i]);
+		try
+		{
+			values[i] = value_get_datum_cxx(param, typid, &nulls[i]);
+		}
+		catch (...)
+		{
+			/* The script can catch the error, free the work arrays. */
+			pfree(values);
+			pfree(nulls);
+			throw;
+		}
 	}
 
 	PG_TRY();
@@ -863,7 +914,17 @@ plv8_PlanExecute(const FunctionCallbackInfo<v8::Value> &args)
 		else
 			typid = SPI_getargtypeid(plan, i);
 
-		values[i] = value_get_datum(param, typid, &nulls[i]);
+		try
+		{
+			values[i] = value_get_datum_cxx(param, typid, &nulls[i]);
+		}
+		catch (...)
+		{
+			/* The script can catch the error, free the work arrays. */
+			pfree(values);
+			pfree(nulls);
+			throw;
+		}
 	}
 
 	PG_TRY();
@@ -1076,17 +1137,21 @@ static void
 plv8_ReturnNext(const FunctionCallbackInfo<v8::Value>& args)
 {
 	Handle<v8::Object>	self = args.This();
-	Handle<v8::Value>	conv_value = self->GetInternalField(PLV8_INTNL_CONV);
 
-	if (!conv_value->IsExternal())
+	if (self->InternalFieldCount() != PLV8_INTNL_MAX)
+		throw js_error("return_next called in context that cannot accept a set");
+
+	Handle<v8::Value>	conv_value = self->GetInternalField(PLV8_INTNL_CONV);
+	Handle<v8::Value>	tupstore_value = self->GetInternalField(PLV8_INTNL_TUPSTORE);
+
+	if (!conv_value->IsExternal() || !tupstore_value->IsExternal())
 		throw js_error("return_next called in context that cannot accept a set");
 
 	Converter *conv = static_cast<Converter *>(
 			Handle<External>::Cast(conv_value)->Value());
 
 	Tuplestorestate *tupstore = static_cast<Tuplestorestate *>(
-			Handle<External>::Cast(
-				self->GetInternalField(PLV8_INTNL_TUPSTORE))->Value());
+			Handle<External>::Cast(tupstore_value)->Value());
 
 	conv->ToDatum(args[0], tupstore);
 
@@ -1198,6 +1263,8 @@ plv8_GetWindowObject(const FunctionCallbackInfo<v8::Value>& args)
 {
 	Isolate*			isolate = args.GetIsolate();
 	Handle<v8::Object>	self = args.This();
+	if (self->InternalFieldCount() != PLV8_INTNL_MAX)
+		throw js_error("get_window_object called in wrong context");
 	Handle<v8::Value>	fcinfo_value =
 			self->GetInternalField(PLV8_INTNL_FCINFO);
 
@@ -1212,12 +1279,39 @@ plv8_GetWindowObject(const FunctionCallbackInfo<v8::Value>& args)
 }
 
 /*
+ * Window methods require one internal field holding the FunctionCallInfo of
+ * the running window function call, which the call stores in the plv8 object.
+ * A window object kept from an earlier call is accepted only while its pointer
+ * is the running call's one, so it never reads memory of a finished call.
+ */
+static inline void
+plv8_CheckWindowObject(Isolate *isolate, Handle<v8::Object> self)
+{
+	if (self->InternalFieldCount() != 1 ||
+		!self->GetInternalField(0)->IsExternal()) {
+		throw js_error("window function api called with wrong object");
+	}
+
+	Local<v8::Object>	plv8_obj = plv8_GetPlv8Object(isolate->GetCurrentContext());
+	if (plv8_obj.IsEmpty())
+		throw js_error("window function api called with wrong object");
+
+	Handle<v8::Value>	current = plv8_obj->GetInternalField(PLV8_INTNL_FCINFO);
+	if (!current->IsExternal() ||
+		Handle<External>::Cast(current)->Value() !=
+		Handle<External>::Cast(self->GetInternalField(0))->Value()) {
+		throw js_error("window function api called with wrong object");
+	}
+}
+
+/*
  * Short-cut routine for window function API
  */
 static inline WindowObject
 plv8_MyWindowObject(const FunctionCallbackInfo<v8::Value>& args)
 {
 	Handle<v8::Object>	self = args.This();
+	plv8_CheckWindowObject(args.GetIsolate(), self);
 	/* fcinfo is embedded in the internal field.  See plv8_GetWindowObject() */
 	FunctionCallInfo fcinfo = static_cast<FunctionCallInfo>(
 			Handle<External>::Cast(self->GetInternalField(0))->Value());
@@ -1241,6 +1335,7 @@ static inline plv8_type *
 plv8_MyArgType(const FunctionCallbackInfo<v8::Value>& args, int argno)
 {
 	Handle<v8::Object>	self = args.This();
+	plv8_CheckWindowObject(args.GetIsolate(), self);
 	FunctionCallInfo fcinfo = static_cast<FunctionCallInfo>(
 			Handle<External>::Cast(self->GetInternalField(0))->Value());
 
@@ -1259,6 +1354,7 @@ static inline void
 plv8_CheckArgno(const FunctionCallbackInfo<v8::Value>& args, int argno)
 {
 	Handle<v8::Object>	self = args.This();
+	plv8_CheckWindowObject(args.GetIsolate(), self);
 	FunctionCallInfo fcinfo = static_cast<FunctionCallInfo>(
 			Handle<External>::Cast(self->GetInternalField(0))->Value());
 
