@@ -660,6 +660,31 @@ plv8_Prepare(const FunctionCallbackInfo<v8::Value> &args)
 }
 
 /*
+ * Plan and cursor methods can be invoked with an arbitrary "this" through
+ * Function.prototype.call/apply, so verify the receiver really is a plan
+ * (two external internal fields) or a cursor (one string internal field)
+ * before touching its internal fields.
+ */
+static inline void
+plv8_CheckPlanObject(Handle<v8::Object> self)
+{
+	if (self->InternalFieldCount() != 2 ||
+		!self->GetInternalField(0)->IsExternal() ||
+		!self->GetInternalField(1)->IsExternal()) {
+		throw js_error("not a plan object");
+	}
+}
+
+static inline void
+plv8_CheckCursorObject(Handle<v8::Object> self)
+{
+	if (self->InternalFieldCount() != 1 ||
+		!self->GetInternalField(0)->IsString()) {
+		throw js_error("cannot find cursor");
+	}
+}
+
+/*
  * plan.cursor(args, ...)
  */
 static void
@@ -675,6 +700,8 @@ plv8_PlanCursor(const FunctionCallbackInfo<v8::Value> &args)
 	Handle<Array>		params;
 	Portal				cursor;
 	plv8_param_state   *parstate = NULL;
+
+	plv8_CheckPlanObject(self);
 
 	plan = static_cast<SPIPlanPtr>(
 			Handle<External>::Cast(self->GetInternalField(0))->Value());
@@ -784,6 +811,8 @@ plv8_PlanExecute(const FunctionCallbackInfo<v8::Value> &args)
 	Local<Context>		context = isolate->GetCurrentContext();
 
 
+	plv8_CheckPlanObject(self);
+
 	plan = static_cast<SPIPlanPtr>(
 			Handle<External>::Cast(self->GetInternalField(0))->Value());
 	/* XXX: Add plan validation */
@@ -875,6 +904,8 @@ plv8_PlanFree(const FunctionCallbackInfo<v8::Value> &args)
 	plv8_param_state   *parstate;
 	int					status = 0;
 
+	plv8_CheckPlanObject(self);
+
 	plan = static_cast<SPIPlanPtr>(
 			Handle<External>::Cast(self->GetInternalField(0))->Value());
 
@@ -903,9 +934,7 @@ plv8_CursorFetch(const FunctionCallbackInfo<v8::Value> &args)
 	Handle<Context> context = isolate->GetCurrentContext();
 	Handle<v8::Object>	self = args.This();
 
-	if (self->InternalFieldCount() == 0) {
-		throw js_error("cannot find cursor");
-	}
+	plv8_CheckCursorObject(self);
 
 	CString				cname(self->GetInternalField(0));
 	Portal				cursor = SPI_cursor_find(cname);
@@ -973,6 +1002,8 @@ plv8_CursorMove(const FunctionCallbackInfo<v8::Value>& args)
 {
 	Isolate*			isolate = args.GetIsolate();
 	Handle<v8::Object>	self = args.This();
+	plv8_CheckCursorObject(self);
+
 	CString				cname(self->GetInternalField(0));
 	Portal				cursor = SPI_cursor_find(cname);
 	int					nmove = 1;
@@ -1015,6 +1046,8 @@ static void
 plv8_CursorClose(const FunctionCallbackInfo<v8::Value> &args)
 {
 	Handle<v8::Object>	self = args.This();
+	plv8_CheckCursorObject(self);
+
 	CString				cname(self->GetInternalField(0));
 	Portal				cursor = SPI_cursor_find(cname);
 
@@ -1216,6 +1249,27 @@ plv8_MyArgType(const FunctionCallbackInfo<v8::Value>& args, int argno)
 
 	/* This is safe to call in C++ context (without PG_TRY). */
 	return get_plv8_type(fcinfo, argno);
+}
+
+/*
+ * Validate a script-supplied argument number before handing it to
+ * WinGetFuncArg*(), which only Assert()s on it.
+ */
+static inline void
+plv8_CheckArgno(const FunctionCallbackInfo<v8::Value>& args, int argno)
+{
+	Handle<v8::Object>	self = args.This();
+	FunctionCallInfo fcinfo = static_cast<FunctionCallInfo>(
+			Handle<External>::Cast(self->GetInternalField(0))->Value());
+
+	if (fcinfo == NULL)
+	{
+		throw js_error("window function api called with wrong object");
+	}
+	if (argno < 0 || argno >= fcinfo->nargs)
+	{
+		throw js_error("argument number out of range");
+	}
 }
 
 /*
@@ -1438,6 +1492,8 @@ plv8_WinGetFuncArgInPartition(const FunctionCallbackInfo<v8::Value>& args)
 	bool		isnull, isout;
 	Datum		res;
 
+	plv8_CheckArgno(args, argno);
+
 	PG_TRY();
 	{
 		res = WinGetFuncArgInPartition(winobj,
@@ -1483,6 +1539,8 @@ plv8_WinGetFuncArgInFrame(const FunctionCallbackInfo<v8::Value>& args)
 	bool		isnull, isout;
 	Datum		res;
 
+	plv8_CheckArgno(args, argno);
+
 	PG_TRY();
 	{
 		res = WinGetFuncArgInFrame(winobj,
@@ -1525,6 +1583,8 @@ plv8_WinGetFuncArgCurrent(const FunctionCallbackInfo<v8::Value>& args)
 	int			argno = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
 	bool		isnull;
 	Datum		res;
+
+	plv8_CheckArgno(args, argno);
 
 	PG_TRY();
 	{
