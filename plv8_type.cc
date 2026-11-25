@@ -25,6 +25,7 @@ extern "C" {
 #include "nodes/memnodes.h"
 #include "utils/memutils.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 } // extern "C"
 
 
@@ -203,8 +204,8 @@ GetJsonbValue(JsonbValue *scalarVal) {
   if (scalarVal->type == jbvNull) {
 		return Local<v8::Value>::New(isolate, Null(isolate));
   } else if (scalarVal->type == jbvString) {
-    /* The string is length-delimited; pass the length rather than copying it to the stack. */
-		return Local<v8::Value>::New(isolate, v8::String::NewFromUtf8(isolate, scalarVal->val.string.val, v8::NewStringType::kNormal, scalarVal->val.string.len).ToLocalChecked());
+    /* The string is length-delimited and in the database encoding. */
+		return ToString(scalarVal->val.string.val, scalarVal->val.string.len);
   } else if (scalarVal->type == jbvNumeric) {
 		return Local<v8::Value>::New(isolate, Number::New(isolate, DatumGetFloat8(plv8_DirectCall1(numeric_float8, PointerGetDatum(scalarVal->val.numeric)))));
   } else if (scalarVal->type == jbvBool) {
@@ -231,10 +232,10 @@ JsonbIterate(JsonbIterator **it, Local<v8::Object> container) {
     case WJB_BEGIN_OBJECT:
 			obj = v8::Object::New(isolate);
 			if (container->IsArray()) {
-				container->Set(context, count, JsonbIterate(it, obj)).Check();
+				container->CreateDataProperty(context, count, JsonbIterate(it, obj)).Check();
 				count++;
 			} else {
-				container->Set(context, key, JsonbIterate(it, obj)).Check();
+				container->CreateDataProperty(context, key.As<v8::Name>(), JsonbIterate(it, obj)).Check();
 			}
       break;
 
@@ -246,10 +247,10 @@ JsonbIterate(JsonbIterator **it, Local<v8::Object> container) {
     case WJB_BEGIN_ARRAY:
 			obj = v8::Array::New(isolate);
 			if (container->IsArray()) {
-				container->Set(context, count, JsonbIterate(it, obj)).Check();
+				container->CreateDataProperty(context, count, JsonbIterate(it, obj)).Check();
 				count++;
 			} else {
-				container->Set(context, key, JsonbIterate(it, obj)).Check();
+				container->CreateDataProperty(context, key.As<v8::Name>(), JsonbIterate(it, obj)).Check();
 			}
       break;
 
@@ -265,12 +266,12 @@ JsonbIterate(JsonbIterator **it, Local<v8::Object> container) {
 
     case WJB_VALUE:
       // object value
-			container->Set(context, key, GetJsonbValue(&val)).Check();
+			container->CreateDataProperty(context, key.As<v8::Name>(), GetJsonbValue(&val)).Check();
       break;
 
     case WJB_ELEM:
       // array element
-			container->Set(context, count, GetJsonbValue(&val)).Check();
+			container->CreateDataProperty(context, count, GetJsonbValue(&val)).Check();
 			count++;
       break;
 
@@ -497,6 +498,63 @@ TimeAs8601 (double millis) {
 	return buf;
 }
 
+/*
+ * Fill a jsonb string value from a JavaScript value.
+ *
+ * The length is taken from the copy in the database encoding.  The UTF-8
+ * source is longer when the database encoding is not UTF-8, and the
+ * serializer copies as many bytes as the length says.
+ *
+ * PostgreSQL text cannot hold U+0000, so a string with it is rejected with
+ * the error that casting such json to jsonb gives.
+ */
+static void
+JsonbStringFromValue(Isolate *isolate, Local<Context> context, Local<v8::Value> value, JsonbValue *val)
+{
+	TryCatch			try_catch(isolate);
+	Local<v8::String>	str = plv8_ToLocal(value->ToString(context), try_catch);
+	v8::String::Utf8Value utf8(isolate, str);
+
+	if (memchr(*utf8, '\0', utf8.length()) != NULL)
+	{
+		PG_TRY();
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_UNTRANSLATABLE_CHARACTER),
+					 errmsg("unsupported Unicode escape sequence"),
+					 errdetail("\\u0000 cannot be converted to text.")));
+		}
+		PG_CATCH();
+		{
+			throw pg_error();
+		}
+		PG_END_TRY();
+	}
+
+	val->type = jbvString;
+	val->val.string.val = ToCStringCopy(utf8);
+	val->val.string.len = strlen(val->val.string.val);
+}
+
+/*
+ * jsonb conversion recurses into nested arrays and objects, without end for
+ * a cyclic object.  V8 does not check its stack limit when properties of a
+ * plain object are read, so check the C stack here.
+ */
+static void
+plv8_CheckStackDepth()
+{
+	PG_TRY();
+	{
+		check_stack_depth();
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+}
+
 static JsonbValue *
 #if PG_VERSION_NUM >= 190000
 JsonbFromValue(JsonbInState *pstate, Local<v8::Value> value, JsonbIteratorToken type) {
@@ -509,10 +567,7 @@ JsonbFromValue(JsonbParseState **pstate, Local<v8::Value> value, JsonbIteratorTo
 
 	// if the token type is a key, the only valid value is jbvString
 	if (type == WJB_KEY) {
-		val.type = jbvString;
-		v8::String::Utf8Value utf8(isolate, value->ToString(context).ToLocalChecked());
-		val.val.string.val = ToCStringCopy(utf8);
-		val.val.string.len = utf8.length();
+		JsonbStringFromValue(isolate, context, value, &val);
 	} else {
 		if (value->IsBoolean()) {
 			val.type = jbvBool;
@@ -522,10 +577,7 @@ JsonbFromValue(JsonbParseState **pstate, Local<v8::Value> value, JsonbIteratorTo
 		} else if (value->IsUndefined()) {
 			return NULL;
 		} else if (value->IsString()) {
-			val.type = jbvString;
-			v8::String::Utf8Value utf8(isolate, value->ToString(context).ToLocalChecked());
-			val.val.string.val = ToCStringCopy(utf8);
-			val.val.string.len = utf8.length();
+			JsonbStringFromValue(isolate, context, value, &val);
 		} else if (value->IsNumber()) {
 			if (value->IsInt32()) {
 				int32 iv = value->Int32Value(context).ToChecked();
@@ -542,7 +594,9 @@ JsonbFromValue(JsonbParseState **pstate, Local<v8::Value> value, JsonbIteratorTo
 				val.type = jbvNumeric;
 			}
 		} else if (value->IsDate()) {
-			double t = value->NumberValue(context).ToChecked();
+			/* valueOf() of a Date can be replaced by the script */
+			TryCatch	try_catch(isolate);
+			double t = plv8_FromMaybe(value->NumberValue(context), try_catch);
 			if (isnan(t)) {
 				val.type = jbvNull;
 			} else {
@@ -552,10 +606,7 @@ JsonbFromValue(JsonbParseState **pstate, Local<v8::Value> value, JsonbIteratorTo
 			}
 		} else {
 			LogType(value, false);
-			val.type = jbvString;
-			v8::String::Utf8Value utf8(isolate, value->ToString(context).ToLocalChecked());
-			val.val.string.val = ToCStringCopy(utf8);
-			val.val.string.len = utf8.length();
+			JsonbStringFromValue(isolate, context, value, &val);
 		}
 	}
 
@@ -575,6 +626,8 @@ JsonbArrayFromArray(JsonbParseState **pstate, Local<v8::Object> object) {
 #endif
 	Isolate *isolate = Isolate::GetCurrent();
 	Local<Context>		context = isolate->GetCurrentContext();
+
+	plv8_CheckStackDepth();
 #if PG_VERSION_NUM >= 190000
 	plv8_PushJsonbValue(pstate, WJB_BEGIN_ARRAY, NULL);
 	JsonbValue *val = pstate->result;
@@ -582,8 +635,9 @@ JsonbArrayFromArray(JsonbParseState **pstate, Local<v8::Object> object) {
 	JsonbValue *val = plv8_PushJsonbValue(pstate, WJB_BEGIN_ARRAY, NULL);
 #endif
 	Local<v8::Array> a = Local<v8::Array>::Cast(object);
+	TryCatch		try_catch(isolate);
 	for (size_t i = 0; i < a->Length(); i++) {
-		Local<v8::Value> o = a->Get(context, i).ToLocalChecked();
+		Local<v8::Value> o = plv8_ToLocal(a->Get(context, i), try_catch);
 
 		if (o->IsArray()) {
 			val = JsonbArrayFromArray(pstate, Local<v8::Array>::Cast(o));
@@ -612,18 +666,22 @@ JsonbObjectFromObject(JsonbParseState **pstate, Local<v8::Object> object) {
 #endif
 	Isolate *isolate = Isolate::GetCurrent();
 	Local<Context>		context = isolate->GetCurrentContext();
+
+	plv8_CheckStackDepth();
 #if PG_VERSION_NUM >= 190000
 	plv8_PushJsonbValue(pstate, WJB_BEGIN_OBJECT, NULL);
 	JsonbValue *val = pstate->result;
 #else
 	JsonbValue *val = plv8_PushJsonbValue(pstate, WJB_BEGIN_OBJECT, NULL);
 #endif
-	Local<Array> arr = object->GetOwnPropertyNames(context).ToLocalChecked();
+	/* A getter or a Proxy trap can throw. */
+	TryCatch		try_catch(isolate);
+	Local<Array> arr = plv8_ToLocal(object->GetOwnPropertyNames(context), try_catch);
 
 	for (size_t i = 0; i < arr->Length(); i++) {
 		Local<v8::Value> v = arr->Get(context, i).ToLocalChecked();
 		val = JsonbFromValue(pstate, v, WJB_KEY);
-		Local<v8::Value> o = object->Get(context, v).ToLocalChecked();
+		Local<v8::Value> o = plv8_ToLocal(object->Get(context, v), try_catch);
 
 		if (o->IsDate()) {
 			val = JsonbFromValue(pstate, o, WJB_VALUE);
@@ -680,6 +738,12 @@ ConvertObject(Local<v8::Object> object) {
 #endif
                 val->val.array.rawScalar = true;
 	}
+	} catch (js_error &e) {
+		MemoryContextSwitchTo(oldcontext);
+		/* the message was made in conversion_context */
+		e.copy_strings();
+		MemoryContextDelete(conversion_context);
+		throw;
 	} catch (...) {
 		MemoryContextSwitchTo(oldcontext);
 		MemoryContextDelete(conversion_context);
@@ -881,13 +945,18 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 					Float8GetDatum((float8) value->NumberValue(isolate->GetCurrentContext()).ToChecked()));
 		break;
 	case DATEOID:
-		if (value->IsDate())
-			return EpochToDate(value->NumberValue(isolate->GetCurrentContext()).ToChecked());
-		break;
 	case TIMESTAMPOID:
 	case TIMESTAMPTZOID:
 		if (value->IsDate())
-			return EpochToTimestampTz(value->NumberValue(isolate->GetCurrentContext()).ToChecked());
+		{
+			/* valueOf() of a Date can be replaced by the script */
+			TryCatch	try_catch(isolate);
+			double		epoch = plv8_FromMaybe(value->NumberValue(isolate->GetCurrentContext()), try_catch);
+
+			if (type->typid == DATEOID)
+				return EpochToDate(epoch);
+			return EpochToTimestampTz(epoch);
+		}
 		break;
 	case BYTEAOID:
 		{
@@ -936,7 +1005,8 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 			JSONObject JSON;
 
 			Handle<v8::Value> result = JSON.Stringify(value);
-			CString str(result);
+			/* JSON.stringify can be replaced by the script */
+			CString str(plv8_ToStringChecked(isolate, result));
 
 			return (Datum) DatumGetJsonbP(plv8_DirectCall1(jsonb_in, (Datum) (char *) str));
 		}
@@ -949,7 +1019,8 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 			JSONObject JSON;
 
 			Handle<v8::Value> result = JSON.Stringify(value);
-			CString str(result);
+			/* JSON.stringify can be replaced by the script */
+			CString str(plv8_ToStringChecked(isolate, result));
 
 			return CStringGetTextDatum(str);
 		}
@@ -957,7 +1028,7 @@ ToScalarDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 	}
 
 	/* Use lexical cast for non-numeric types. */
-	CString		str(value);
+	CString		str(plv8_ToStringChecked(isolate, value));
 	Datum		result;
 
 	PG_TRY();
@@ -1051,12 +1122,14 @@ ToArrayDatum(Handle<v8::Value> value, bool *isnull, plv8_type *type)
 	/* The script can catch a conversion error, free the work arrays anyway. */
 	try
 	{
+	/* An element getter can throw. */
+	TryCatch	try_catch(isolate);
 	for (int i = 0; i < length; i++) {
 		if (type->is_composite)
 		{
-			values[i] = ToRecordDatum(array->Get(context, i).ToLocalChecked(), &nulls[i], type);
+			values[i] = ToRecordDatum(plv8_ToLocal(array->Get(context, i), try_catch), &nulls[i], type);
 		} else {
-			values[i] = ToScalarDatum(array->Get(context, i).ToLocalChecked(), &nulls[i], type);
+			values[i] = ToScalarDatum(plv8_ToLocal(array->Get(context, i), try_catch), &nulls[i], type);
 		}
 	}
 
@@ -1305,7 +1378,7 @@ ToArrayValue(Datum datum, bool isnull, plv8_type *type)
 	try
 	{
 		for (int i = 0; i < nelems; i++)
-			result->Set(context, i, ToValue(values[i], nulls[i], &base)).Check();
+			result->CreateDataProperty(context, i, ToValue(values[i], nulls[i], &base)).Check();
 	}
 	catch (...)
 	{
@@ -1392,12 +1465,10 @@ ToString(Datum value, plv8_type *type)
 	}
 	PG_END_TRY();
 
-	Local<v8::String>	result =
-		encoding == PG_UTF8
-			? v8::String::NewFromUtf8(Isolate::GetCurrent(), str).ToLocalChecked()
-			: ToString(str, strlen(str), encoding);
-	pfree(str);
+	/* With an explicit length, V8 checks it against String::kMaxLength. */
+	Local<v8::String>	result = ToString(str, strlen(str), encoding);
 
+	pfree(str);
 	return result;
 }
 
@@ -1426,9 +1497,15 @@ ToString(const char *str, int len, int encoding)
 
 	if (utf8 != str)
 		len = strlen(utf8);
-	Local<v8::String> result = v8::String::NewFromUtf8(isolate, utf8, NewStringType::kNormal, len).ToLocalChecked();
+
+	/* NewFromUtf8() fails, without an exception, above String::kMaxLength. */
+	Local<v8::String>	result;
+	bool		ok = v8::String::NewFromUtf8(isolate, utf8, NewStringType::kNormal, len).ToLocal(&result);
+
 	if (utf8 != str)
 		pfree(utf8);
+	if (!ok)
+		throw js_error("value is too long for a JavaScript string");
 	return result;
 }
 

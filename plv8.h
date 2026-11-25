@@ -61,6 +61,7 @@ public:
 	explicit js_error(v8::Isolate *isolate, v8::Local<v8::Value> exception, v8::Local<v8::Message> message) noexcept;
 	explicit js_error(v8::TryCatch &try_catch) noexcept;
 	v8::Local<v8::Value> error_object();
+	void copy_strings();
 	__attribute__((noreturn)) void rethrow(const char *msg_format = nullptr) noexcept;
 	void log(int elevel, const char *msg_format = nullptr) noexcept;
 };
@@ -74,6 +75,51 @@ class pg_error
 public:
 	__attribute__((noreturn)) void rethrow() throw();
 };
+
+/*
+ * Unwrap a V8 result that script code can leave empty.
+ *
+ * A getter, valueOf(), toString() or a Proxy trap runs script code, and when
+ * that code throws, the V8 call returns an empty result.  ToLocalChecked()
+ * and ToChecked() abort the backend on an empty result.  These helpers throw
+ * js_error with the script exception instead.  The caller opens the TryCatch
+ * before the V8 call.
+ */
+__attribute__((noreturn)) extern void plv8_ThrowScriptError(v8::TryCatch &try_catch);
+
+template <class T>
+static inline v8::Local<T>
+plv8_ToLocal(v8::MaybeLocal<T> value, v8::TryCatch &try_catch)
+{
+	v8::Local<T>	result;
+
+	if (!value.ToLocal(&result))
+		plv8_ThrowScriptError(try_catch);
+	return result;
+}
+
+template <class T>
+static inline T
+plv8_FromMaybe(v8::Maybe<T> value, v8::TryCatch &try_catch)
+{
+	T			result;
+
+	if (!value.To(&result))
+		plv8_ThrowScriptError(try_catch);
+	return result;
+}
+
+/*
+ * ToString() of a value that has to become a C string.  CString holds NULL
+ * when toString() throws or the value is a Symbol.
+ */
+static inline v8::Local<v8::String>
+plv8_ToStringChecked(v8::Isolate *isolate, v8::Local<v8::Value> value)
+{
+	v8::TryCatch	try_catch(isolate);
+
+	return plv8_ToLocal(value->ToString(isolate->GetCurrentContext()), try_catch);
+}
 
 typedef enum plv8_external_array_type
 {

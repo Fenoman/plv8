@@ -16,6 +16,7 @@ extern "C" {
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "nodes/memnodes.h"
 } // extern "C"
 
@@ -143,12 +144,17 @@ SPIResultToValue(int status)
 	case SPI_OK_DELETE_RETURNING:
 	case SPI_OK_UPDATE_RETURNING:
 	{
+		/*
+		 * Converting a value can run script code (a replaced JSON.parse)
+		 * that runs SQL and replaces SPI_tuptable, so keep this one.
+		 */
+		SPITupleTable  *tuptable = SPI_tuptable;
 		int				nrows = SPI_processed;
-		Converter		conv(SPI_tuptable->tupdesc);
+		Converter		conv(tuptable->tupdesc);
 		Local<Array>	rows = Array::New(isolate, nrows);
 
 		for (int r = 0; r < nrows; r++)
-			rows->Set(context, r, conv.ToValue(SPI_tuptable->vals[r])).Check();
+			rows->CreateDataProperty(context, r, conv.ToValue(tuptable->vals[r])).Check();
 
 		result = rows;
 		break;
@@ -173,7 +179,20 @@ SubTranBlock::enter()
 
 	m_resowner = CurrentResourceOwner;
 	m_mcontext = CurrentMemoryContext;
-	BeginInternalSubTransaction(NULL);
+	/*
+	 * Callers begin the subtransaction before their PG_TRY, as PL/pgSQL
+	 * does, so that its PG_CATCH rolls back only a subtransaction that was
+	 * begun.  Report an error here as a C++ exception.
+	 */
+	PG_TRY();
+	{
+		BeginInternalSubTransaction(NULL);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
 	MemoryContextSwitchTo(m_mcontext);
 }
 
@@ -195,7 +214,9 @@ JSONObject::JSONObject()
 	Isolate* isolate = v8::Isolate::GetCurrent();
 	Handle<Context> context = isolate->GetCurrentContext();
 	Handle<Object> global = context->Global();
-	MaybeLocal<v8::Object> maybeJson = global->Get(context, v8::String::NewFromUtf8(isolate, "JSON").ToLocalChecked()).ToLocalChecked()->ToObject(isolate->GetCurrentContext());
+	/* The script can replace JSON and its methods with getters. */
+	TryCatch try_catch(isolate);
+	MaybeLocal<v8::Object> maybeJson = plv8_ToLocal(global->Get(context, v8::String::NewFromUtf8(isolate, "JSON").ToLocalChecked()), try_catch)->ToObject(isolate->GetCurrentContext());
 	if (maybeJson.IsEmpty())
 		throw js_error("JSON not found");
 	m_json = maybeJson.ToLocalChecked();
@@ -209,13 +230,13 @@ JSONObject::Parse(Handle<v8::Value> str)
 {
 	Isolate* isolate = v8::Isolate::GetCurrent();
 	Handle<Context> context = isolate->GetCurrentContext();
+	TryCatch try_catch(isolate);
 	Handle<Function> parse_func =
-		Handle<Function>::Cast(m_json->Get(context, v8::String::NewFromUtf8(isolate, "parse").ToLocalChecked()).ToLocalChecked());
+		Handle<Function>::Cast(plv8_ToLocal(m_json->Get(context, v8::String::NewFromUtf8(isolate, "parse").ToLocalChecked()), try_catch));
 
 	if (parse_func.IsEmpty())
 		throw js_error("JSON.parse() not found");
 
-	TryCatch try_catch(isolate);
 	MaybeLocal<v8::Value> value = parse_func->Call(context, m_json, 1, &str);
 	if (value.IsEmpty())
 		throw js_error(try_catch);
@@ -230,13 +251,13 @@ JSONObject::Stringify(Handle<v8::Value> val)
 {
 	Isolate* isolate = v8::Isolate::GetCurrent();
 	Handle<Context> context = isolate->GetCurrentContext();
+	TryCatch try_catch(isolate);
 	Handle<Function> stringify_func =
-		Handle<Function>::Cast(m_json->Get(context, v8::String::NewFromUtf8(isolate, "stringify").ToLocalChecked()).ToLocalChecked());
+		Handle<Function>::Cast(plv8_ToLocal(m_json->Get(context, v8::String::NewFromUtf8(isolate, "stringify").ToLocalChecked()), try_catch));
 
 	if (stringify_func.IsEmpty())
 		throw js_error("JSON.stringify() not found");
 
-	TryCatch try_catch(isolate);
 	MaybeLocal<v8::Value> value = stringify_func->Call(isolate->GetCurrentContext(), m_json, 1, &val);
 	if (value.IsEmpty())
 		throw js_error(try_catch);
@@ -370,17 +391,17 @@ plv8_FunctionInvoker(const FunctionCallbackInfo<v8::Value> &args) throw()
 		FreeErrorData(edata);
 
 		Handle<v8::Object> err = Exception::Error(message)->ToObject(isolate->GetCurrentContext()).ToLocalChecked();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "sqlerrcode").ToLocalChecked(), sqlerrcode).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "schema_name").ToLocalChecked(), schema_name).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "table_name").ToLocalChecked(), table_name).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "column_name").ToLocalChecked(), column_name).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "datatype_name").ToLocalChecked(), datatype_name).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "constraint_name").ToLocalChecked(), constraint_name).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "detail").ToLocalChecked(), detail).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "hint").ToLocalChecked(), hint).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "context").ToLocalChecked(), sql_context).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "internalquery").ToLocalChecked(), internalquery).Check();
-		err->Set(context, v8::String::NewFromUtf8(isolate, "code").ToLocalChecked(), code).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "sqlerrcode").ToLocalChecked(), sqlerrcode).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "schema_name").ToLocalChecked(), schema_name).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "table_name").ToLocalChecked(), table_name).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "column_name").ToLocalChecked(), column_name).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "datatype_name").ToLocalChecked(), datatype_name).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "constraint_name").ToLocalChecked(), constraint_name).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "detail").ToLocalChecked(), detail).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "hint").ToLocalChecked(), hint).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "context").ToLocalChecked(), sql_context).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "internalquery").ToLocalChecked(), internalquery).Check();
+		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "code").ToLocalChecked(), code).Check();
 
 		args.GetReturnValue().Set(isolate->ThrowException(err));
 	}
@@ -400,7 +421,12 @@ plv8_Elog(const FunctionCallbackInfo<v8::Value>& args)
 		return;
 	}
 
-	int	elevel = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+	int	elevel;
+	{
+		/* valueOf() of the argument can throw */
+		TryCatch	try_catch(isolate);
+		elevel = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+	}
 	switch (elevel)
 	{
 	case DEBUG5:
@@ -489,7 +515,19 @@ value_get_datum_cxx(Handle<v8::Value> value, Oid typid, char *isnull)
 		bool		IsNull;
 		Datum		datum;
 
-		plv8_fill_type(&typinfo, typid);
+		/*
+		 * The type comes from the plan: a parameter number the query skips
+		 * has no type, and a type can be dropped after plv8.prepare().
+		 */
+		PG_TRY();
+		{
+			plv8_fill_type(&typinfo, typid);
+		}
+		PG_CATCH();
+		{
+			throw pg_error();
+		}
+		PG_END_TRY();
 		datum = ToDatum(value, &IsNull, &typinfo);
 		*isnull = (IsNull ?  'n' : ' ');
 		return datum;
@@ -504,14 +542,48 @@ static Datum
 value_get_datum(Handle<v8::Value> value, Oid typid, char *isnull)
 {
 	Datum		datum = (Datum) 0;
+	js_error	js_err;
+	bool		js_failed = false;
+	bool		pg_failed = false;
 
 	try
 	{
 		datum = value_get_datum_cxx(value, typid, isnull);
 	}
-	catch (js_error& e){ e.rethrow(); }
-	catch (pg_error& e){ e.rethrow(); }
+	catch (js_error& e) { js_err = e; js_failed = true; }
+	catch (pg_error& e) { pg_failed = true; }
+
+	/* ereport() only after the C++ exception has ended, siglongjmp skips its end */
+	if (js_failed)
+		js_err.rethrow();
+	if (pg_failed)
+		pg_error().rethrow();
 	return datum;
+}
+
+/*
+ * params[i] for callers inside PG_TRY.  A getter on the array can throw, the
+ * error is reported with ereport() as in value_get_datum().
+ */
+static Handle<v8::Value>
+value_get_param(Handle<Array> params, int i)
+{
+	Isolate	   *isolate = Isolate::GetCurrent();
+	Handle<v8::Value>	param;
+	js_error	js_err;
+	bool		js_failed = false;
+
+	try
+	{
+		TryCatch	try_catch(isolate);
+
+		param = plv8_ToLocal(params->Get(isolate->GetCurrentContext(), i), try_catch);
+	}
+	catch (js_error& e) { js_err = e; js_failed = true; }
+
+	if (js_failed)
+		js_err.rethrow();
+	return param;
 }
 
 static int
@@ -523,8 +595,6 @@ plv8_execute_params(const char *sql, Handle<Array> params)
 	int				nparam = params->Length();
 	Datum		   *values = (Datum *) palloc(sizeof(Datum) * nparam);
 	char		   *nulls = (char *) palloc(sizeof(char) * nparam);
-	Isolate *isolate = Isolate::GetCurrent();
-	Handle<Context> context = isolate->GetCurrentContext();
 
 /*
  * Since 9.0, SPI may have the parser deduce the parameter types.  In prior
@@ -542,7 +612,7 @@ plv8_execute_params(const char *sql, Handle<Array> params)
 				parstate.numParams, nparam);
 	for (int i = 0; i < nparam; i++)
 	{
-		Handle<v8::Value>	param = params->Get(context, i).ToLocalChecked();
+		Handle<v8::Value>	param = value_get_param(params, i);
 		values[i] = value_get_datum(param,
 								  parstate.paramTypes[i], &nulls[i]);
 	}
@@ -562,7 +632,7 @@ convertArgsToArray(const FunctionCallbackInfo<v8::Value> &args, int start, int d
 	Local<Array> result = Array::New(args.GetIsolate(), args.Length() - start);
 	for (int i = start; i < args.Length(); i++)
 	{
-		result->Set(context, i - downshift, args[i]).Check();
+		result->CreateDataProperty(context, i - downshift, args[i]).Check();
 	}
 	return result;
 }
@@ -580,7 +650,7 @@ plv8_Execute(const FunctionCallbackInfo<v8::Value> &args)
 		return;
 	}
 
-	CString			sql(args[0]);
+	CString			sql(plv8_ToStringChecked(args.GetIsolate(), args[0]));
 	Handle<Array>	params;
 
 	if (args.Length() >= 2)
@@ -595,13 +665,14 @@ plv8_Execute(const FunctionCallbackInfo<v8::Value> &args)
 
 
 	SubTranBlock	subtran;
+	subtran.enter();
 	PG_TRY();
 	{
-		subtran.enter();
 		if (nparam == 0)
 			status = SPI_exec(sql, 0);
 		else
 			status = plv8_execute_params(sql, params);
+		subtran.exit(true);
 	}
 	PG_CATCH();
 	{
@@ -610,7 +681,6 @@ plv8_Execute(const FunctionCallbackInfo<v8::Value> &args)
 	}
 	PG_END_TRY();
 
-	subtran.exit(true);
 	args.GetReturnValue().Set(SPIResultToValue(status));
 }
 
@@ -623,11 +693,12 @@ plv8_Prepare(const FunctionCallbackInfo<v8::Value> &args)
 	Isolate *		isolate = args.GetIsolate();
 	Handle<Context> context = isolate->GetCurrentContext();
 	SPIPlanPtr		initial = NULL, saved;
-	CString			sql(args[0]);
+	CString			sql(plv8_ToStringChecked(isolate, args[0]));
 	Handle<Array>	array;
 	int				arraylen = 0;
 	Oid			   *types = NULL;
 	plv8_param_state *parstate = NULL;
+	volatile MemoryContext param_cxt = NULL;
 
 	if (args.Length() > 1)
 	{
@@ -650,8 +721,23 @@ plv8_Prepare(const FunctionCallbackInfo<v8::Value> &args)
 
 	for (int i = 0; i < arraylen; i++)
 	{
-		CString			typestr(array->Get(context, i).ToLocalChecked());
+		Local<v8::String>	typename_str;
 		int32			typemod;
+
+		/* A getter or toString() of a type name can throw. */
+		try
+		{
+			TryCatch	try_catch(isolate);
+
+			typename_str = plv8_ToStringChecked(isolate, plv8_ToLocal(array->Get(context, i), try_catch));
+		}
+		catch (...)
+		{
+			pfree(types);
+			throw;
+		}
+
+		CString			typestr(typename_str);
 
 		PG_TRY();
 		{
@@ -674,19 +760,31 @@ plv8_Prepare(const FunctionCallbackInfo<v8::Value> &args)
 	{
 		if (args.Length() == 1)
 		{
-			parstate =
-				(plv8_param_state *) palloc0(sizeof(plv8_param_state));
-			parstate->memcontext = CurrentMemoryContext;
+			/*
+			 * The saved plan passes parstate to the parser hooks again when
+			 * it is re-planned, so parstate lives until plan.free().
+			 */
+			param_cxt = AllocSetContextCreate(TopMemoryContext,
+											  "plv8 plan parameters",
+											  ALLOCSET_SMALL_SIZES);
+			parstate = (plv8_param_state *)
+				MemoryContextAllocZero(param_cxt, sizeof(plv8_param_state));
+			parstate->memcontext = param_cxt;
 			initial = SPI_prepare_params(sql, plv8_variable_param_setup,
 										 parstate, 0);
 		}
 		else
 		initial = SPI_prepare(sql, arraylen, types);
+		/* Some failures, such as no SPI connection, give NULL and SPI_result. */
+		if (initial == NULL)
+			elog(ERROR, "SPI_prepare failed: %s", SPI_result_code_string(SPI_result));
 		saved = SPI_saveplan(initial);
 		SPI_freeplan(initial);
 	}
 	PG_CATCH();
 	{
+		if (param_cxt != NULL)
+			MemoryContextDelete(param_cxt);
 		throw pg_error();
 	}
 	PG_END_TRY();
@@ -741,6 +839,7 @@ plv8_PlanCursor(const FunctionCallbackInfo<v8::Value> &args)
 	Handle<Array>		params;
 	Portal				cursor;
 	plv8_param_state   *parstate = NULL;
+	Oid				   *types;
 
 	plv8_CheckPlanObject(self);
 
@@ -787,33 +886,38 @@ plv8_PlanCursor(const FunctionCallbackInfo<v8::Value> &args)
 		throw js_error(pstrdup(buf.data));
 	}
 
+	/*
+	 * Reading and converting the parameters runs script code (getters,
+	 * toString()), which can free this plan.  Take the parameter types
+	 * before it runs and check the plan after.
+	 */
 	if (nparam > 0)
 	{
 		values = (Datum *) palloc(sizeof(Datum) * nparam);
 		nulls = (char *) palloc(sizeof(char) * nparam);
-	}
-
-	for (int i = 0; i < nparam; i++)
-	{
-		Handle<v8::Value>	param = params->Get(context, i).ToLocalChecked();
-		Oid					typid;
-
-		if (parstate)
-			typid = parstate->paramTypes[i];
-		else
-			typid = SPI_getargtypeid(plan, i);
+		types = (Oid *) palloc(sizeof(Oid) * nparam);
+		for (int i = 0; i < nparam; i++)
+			types[i] = parstate ? parstate->paramTypes[i] : SPI_getargtypeid(plan, i);
 
 		try
 		{
-			values[i] = value_get_datum_cxx(param, typid, &nulls[i]);
+			TryCatch	try_catch(isolate);
+
+			for (int i = 0; i < nparam; i++)
+				values[i] = value_get_datum_cxx(plv8_ToLocal(params->Get(context, i), try_catch),
+												types[i], &nulls[i]);
+			if (Handle<External>::Cast(self->GetInternalField(0))->Value() != plan)
+				throw js_error("plan was freed while its parameters were converted");
 		}
 		catch (...)
 		{
 			/* The script can catch the error, free the work arrays. */
 			pfree(values);
 			pfree(nulls);
+			pfree(types);
 			throw;
 		}
+		pfree(types);
 	}
 
 	PG_TRY();
@@ -858,6 +962,7 @@ plv8_PlanExecute(const FunctionCallbackInfo<v8::Value> &args)
 	SubTranBlock		subtran;
 	int					status;
 	plv8_param_state   *parstate = NULL;
+	Oid				   *types;
 	Isolate *		isolate = args.GetIsolate();
 	Local<Context>		context = isolate->GetCurrentContext();
 
@@ -898,38 +1003,43 @@ plv8_PlanExecute(const FunctionCallbackInfo<v8::Value> &args)
 		throw js_error(pstrdup(buf.data));
 	}
 
+	/*
+	 * Reading and converting the parameters runs script code (getters,
+	 * toString()), which can free this plan.  Take the parameter types
+	 * before it runs and check the plan after.
+	 */
 	if (nparam > 0)
 	{
 		values = (Datum *) palloc(sizeof(Datum) * nparam);
 		nulls = (char *) palloc(sizeof(char) * nparam);
-	}
-
-	for (int i = 0; i < nparam; i++)
-	{
-		Handle<v8::Value>	param = params->Get(context, i).ToLocalChecked();
-		Oid					typid;
-
-		if (parstate)
-			typid = parstate->paramTypes[i];
-		else
-			typid = SPI_getargtypeid(plan, i);
+		types = (Oid *) palloc(sizeof(Oid) * nparam);
+		for (int i = 0; i < nparam; i++)
+			types[i] = parstate ? parstate->paramTypes[i] : SPI_getargtypeid(plan, i);
 
 		try
 		{
-			values[i] = value_get_datum_cxx(param, typid, &nulls[i]);
+			TryCatch	try_catch(isolate);
+
+			for (int i = 0; i < nparam; i++)
+				values[i] = value_get_datum_cxx(plv8_ToLocal(params->Get(context, i), try_catch),
+												types[i], &nulls[i]);
+			if (Handle<External>::Cast(self->GetInternalField(0))->Value() != plan)
+				throw js_error("plan was freed while its parameters were converted");
 		}
 		catch (...)
 		{
 			/* The script can catch the error, free the work arrays. */
 			pfree(values);
 			pfree(nulls);
+			pfree(types);
 			throw;
 		}
+		pfree(types);
 	}
 
+	subtran.enter();
 	PG_TRY();
 	{
-		subtran.enter();
 		if (parstate)
 		{
 			ParamListInfo	paramLI;
@@ -939,6 +1049,7 @@ plv8_PlanExecute(const FunctionCallbackInfo<v8::Value> &args)
 		}
 		else
 			status = SPI_execute_plan(plan, values, nulls, false, 0);
+		subtran.exit(true);
 	}
 	PG_CATCH();
 	{
@@ -947,10 +1058,12 @@ plv8_PlanExecute(const FunctionCallbackInfo<v8::Value> &args)
 	}
 	PG_END_TRY();
 
-	subtran.exit(true);
+
+	/* converting the result can run SQL and replace SPI_tuptable */
+	SPITupleTable  *tuptable = SPI_tuptable;
 
 	args.GetReturnValue().Set(SPIResultToValue(status));
-	SPI_freetuptable(SPI_tuptable);
+	SPI_freetuptable(tuptable);
 }
 
 /*
@@ -979,7 +1092,7 @@ plv8_PlanFree(const FunctionCallbackInfo<v8::Value> &args)
 			Handle<External>::Cast(self->GetInternalField(1))->Value());
 
 	if (parstate)
-		pfree(parstate);
+		MemoryContextDelete(parstate->memcontext);
 	self->SetInternalField(1, External::New(isolate, 0));
 
 	args.GetReturnValue().Set(Int32::New(isolate, status));
@@ -1008,50 +1121,66 @@ plv8_CursorFetch(const FunctionCallbackInfo<v8::Value> &args)
 	if (args.Length() >= 1)
 	{
 		wantarray = true;
-		nfetch = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+		{
+			/* valueOf() of the argument can throw */
+			TryCatch	try_catch(isolate);
+			nfetch = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+		}
 
 		if (nfetch < 0)
 		{
 			nfetch = -nfetch;
 			forward = false;
 		}
+
+		/* valueOf() of the argument can close this cursor */
+		cursor = SPI_cursor_find(cname);
+		if (!cursor)
+			throw js_error("cannot find cursor");
 	}
+	/* An error rolls back the subtransaction only, the script can catch it. */
+	SubTranBlock		subtran;
+	subtran.enter();
 	PG_TRY();
 	{
 		SPI_cursor_fetch(cursor, forward, nfetch);
+		subtran.exit(true);
 	}
 	PG_CATCH();
 	{
-		SPI_rollback();
-		SPI_finish();
+		subtran.exit(false);
 		throw pg_error();
 	}
 	PG_END_TRY();
 
-	if (SPI_processed > 0)
+	/* converting a row can run SQL and replace SPI_tuptable */
+	SPITupleTable	   *tuptable = SPI_tuptable;
+	uint64				processed = SPI_processed;
+
+	if (processed > 0)
 	{
-		Converter			conv(SPI_tuptable->tupdesc);
+		Converter			conv(tuptable->tupdesc);
 
 		if (!wantarray)
 		{
-			Handle<v8::Object>	result = conv.ToValue(SPI_tuptable->vals[0]);
+			Handle<v8::Object>	result = conv.ToValue(tuptable->vals[0]);
 			args.GetReturnValue().Set(result);
-			SPI_freetuptable(SPI_tuptable);
+			SPI_freetuptable(tuptable);
 
 			return;
 		}
 		else
 		{
 			Handle<Array> array = Array::New(isolate);
-			for (unsigned int i = 0; i < SPI_processed; i++)
-				array->Set(context, i, conv.ToValue(SPI_tuptable->vals[i])).Check();
+			for (unsigned int i = 0; i < processed; i++)
+				array->CreateDataProperty(context, i, conv.ToValue(tuptable->vals[i])).Check();
 			args.GetReturnValue().Set(array);
-			SPI_freetuptable(SPI_tuptable);
+			SPI_freetuptable(tuptable);
 			return;
 		}
 	}
 
-	SPI_freetuptable(SPI_tuptable);
+	SPI_freetuptable(tuptable);
 	args.GetReturnValue().Set(Undefined(isolate));
 }
 
@@ -1078,21 +1207,33 @@ plv8_CursorMove(const FunctionCallbackInfo<v8::Value>& args)
 		return;
 	}
 
-	nmove = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+	{
+		/* valueOf() of the argument can throw */
+		TryCatch	try_catch(isolate);
+		nmove = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+	}
 	if (nmove < 0)
 	{
 		nmove = -nmove;
 		forward = false;
 	}
 
+	/* valueOf() of the argument can close this cursor */
+	cursor = SPI_cursor_find(cname);
+	if (!cursor)
+		throw js_error("cannot find cursor");
+
+	/* An error rolls back the subtransaction only, the script can catch it. */
+	SubTranBlock		subtran;
+	subtran.enter();
 	PG_TRY();
 	{
 		SPI_cursor_move(cursor, forward, nmove);
+		subtran.exit(true);
 	}
 	PG_CATCH();
 	{
-		SPI_rollback();
-		SPI_finish();
+		subtran.exit(false);
 		throw pg_error();
 	}
 	PG_END_TRY();
@@ -1115,14 +1256,17 @@ plv8_CursorClose(const FunctionCallbackInfo<v8::Value> &args)
 	if (!cursor)
 		throw js_error("cannot find cursor");
 
+	/* An error rolls back the subtransaction only, the script can catch it. */
+	SubTranBlock		subtran;
+	subtran.enter();
 	PG_TRY();
 	{
 		SPI_cursor_close(cursor);
+		subtran.exit(true);
 	}
 	PG_CATCH();
 	{
-		SPI_rollback();
-		SPI_finish();
+		subtran.exit(false);
 		throw pg_error();
 	}
 	PG_END_TRY();
@@ -1183,7 +1327,20 @@ plv8_Subtransaction(const FunctionCallbackInfo<v8::Value>& args)
 	TryCatch try_catch(isolate);
 	MaybeLocal<v8::Value> result = func->Call(isolate->GetCurrentContext(), func, 0, emptyargs);
 
-	subtran.exit(!result.IsEmpty());
+	/* Releasing can fail in a commit callback, roll back then. */
+	bool		release = !result.IsEmpty();
+
+	PG_TRY();
+	{
+		subtran.exit(release);
+	}
+	PG_CATCH();
+	{
+		if (release)
+			subtran.exit(false);
+		throw pg_error();
+	}
+	PG_END_TRY();
 
 	if (result.IsEmpty())
 		throw js_error(try_catch);
@@ -1201,7 +1358,7 @@ plv8_FindFunction(const FunctionCallbackInfo<v8::Value>& args)
 		args.GetReturnValue().Set(Undefined(isolate));
 		return;
 	}
-	CString				signature(args[0]);
+	CString				signature(plv8_ToStringChecked(isolate, args[0]));
 	Local<Function>		func;
 	// Stack-allocate FunctionCallInfoBaseData with
 	// space for 2 arguments:
@@ -1384,7 +1541,12 @@ plv8_WinGetPartitionLocal(const FunctionCallbackInfo<v8::Value>& args)
 	if (args.Length() < 1)
 		size = 1000; /* default 1K */
 	else {
-		const int input_size = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+		int			input_size;
+		{
+			/* valueOf() of the argument can throw */
+			TryCatch	try_catch(isolate);
+			input_size = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+		}
 		if (input_size < 0) {
 			args.GetReturnValue().Set(isolate->ThrowException(v8::String::NewFromUtf8(args.GetIsolate(), "allocation size cannot be negative").ToLocalChecked()));
 			return;
@@ -1440,7 +1602,8 @@ plv8_WinSetPartitionLocal(const FunctionCallbackInfo<v8::Value>& args)
 
 	JSONObject JSON;
 	Handle<v8::Value> value = JSON.Stringify(args[0]);
-	CString str(value);
+	/* JSON.stringify can be replaced by the script */
+	CString str(plv8_ToStringChecked(isolate, value));
 	size_t str_size = strlen(str);
 	size_t size = str_size + sizeof(size_t) * 2;
 	window_storage *storage;
@@ -1526,7 +1689,12 @@ plv8_WinSetMarkPosition(const FunctionCallbackInfo<v8::Value>& args)
                 args.GetReturnValue().Set(Undefined(isolate));
 		return;
         }
-	int64		markpos = args[0]->IntegerValue(isolate->GetCurrentContext()).ToChecked();
+	int64		markpos;
+	{
+		/* valueOf() of the argument can throw */
+		TryCatch	try_catch(isolate);
+		markpos = plv8_FromMaybe(args[0]->IntegerValue(isolate->GetCurrentContext()), try_catch);
+	}
 
 	PG_TRY();
 	{
@@ -1553,9 +1721,14 @@ plv8_WinRowsArePeers(const FunctionCallbackInfo<v8::Value>& args)
                 args.GetReturnValue().Set(Undefined(isolate));
 		return;
 	}
-	int64		pos1 = args[0]->IntegerValue(isolate->GetCurrentContext()).ToChecked();
-	int64		pos2 = args[1]->IntegerValue(isolate->GetCurrentContext()).ToChecked();
+	int64		pos1, pos2;
 	bool		res = false;
+	{
+		/* valueOf() of the arguments can throw */
+		TryCatch	try_catch(isolate);
+		pos1 = plv8_FromMaybe(args[0]->IntegerValue(isolate->GetCurrentContext()), try_catch);
+		pos2 = plv8_FromMaybe(args[1]->IntegerValue(isolate->GetCurrentContext()), try_catch);
+	}
 
 	PG_TRY();
 	{
@@ -1581,9 +1754,14 @@ plv8_WinGetFuncArgInPartition(const FunctionCallbackInfo<v8::Value>& args)
 	/* Since we return undefined in "isout" case, throw if arg isn't enough. */
 	if (args.Length() < 4)
 		throw js_error("argument not enough");
-	int			argno = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
-	int			relpos = args[1]->Int32Value(isolate->GetCurrentContext()).ToChecked();
-	int			seektype = args[2]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+	int			argno, relpos, seektype;
+	{
+		/* valueOf() of the arguments can throw */
+		TryCatch	try_catch(isolate);
+		argno = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+		relpos = plv8_FromMaybe(args[1]->Int32Value(isolate->GetCurrentContext()), try_catch);
+		seektype = plv8_FromMaybe(args[2]->Int32Value(isolate->GetCurrentContext()), try_catch);
+	}
 	bool		set_mark = args[3]->BooleanValue(isolate);
 	bool		isnull, isout;
 	Datum		res;
@@ -1628,9 +1806,14 @@ plv8_WinGetFuncArgInFrame(const FunctionCallbackInfo<v8::Value>& args)
 	/* Since we return undefined in "isout" case, throw if arg isn't enough. */
 	if (args.Length() < 4)
 		throw js_error("argument not enough");
-	int			argno = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
-	int			relpos = args[1]->Int32Value(isolate->GetCurrentContext()).ToChecked();
-	int			seektype = args[2]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+	int			argno, relpos, seektype;
+	{
+		/* valueOf() of the arguments can throw */
+		TryCatch	try_catch(isolate);
+		argno = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+		relpos = plv8_FromMaybe(args[1]->Int32Value(isolate->GetCurrentContext()), try_catch);
+		seektype = plv8_FromMaybe(args[2]->Int32Value(isolate->GetCurrentContext()), try_catch);
+	}
 	bool		set_mark = args[3]->BooleanValue(isolate);
 	bool		isnull, isout;
 	Datum		res;
@@ -1676,7 +1859,12 @@ plv8_WinGetFuncArgCurrent(const FunctionCallbackInfo<v8::Value>& args)
                 args.GetReturnValue().Set(Undefined(isolate));
 		return;
         }
-	int			argno = args[0]->Int32Value(isolate->GetCurrentContext()).ToChecked();
+	int			argno;
+	{
+		/* valueOf() of the argument can throw */
+		TryCatch	try_catch(isolate);
+		argno = plv8_FromMaybe(args[0]->Int32Value(isolate->GetCurrentContext()), try_catch);
+	}
 	bool		isnull;
 	Datum		res;
 
@@ -1709,7 +1897,7 @@ plv8_QuoteLiteral(const FunctionCallbackInfo<v8::Value>& args)
                 args.GetReturnValue().Set(Undefined(args.GetIsolate()));
 		return;
 	}
-	CString			instr(args[0]);
+	CString			instr(plv8_ToStringChecked(args.GetIsolate(), args[0]));
 	char		   *result;
 
 	PG_TRY();
@@ -1735,7 +1923,7 @@ plv8_QuoteNullable(const FunctionCallbackInfo<v8::Value>& args)
                 args.GetReturnValue().Set(Undefined(args.GetIsolate()));
 		return;
 	}
-	CString			instr(args[0]);
+	CString			instr(plv8_ToStringChecked(args.GetIsolate(), args[0]));
 	char		   *result;
 
 	if (args[0]->IsNull() || args[0]->IsUndefined()) {
@@ -1766,7 +1954,7 @@ plv8_QuoteIdent(const FunctionCallbackInfo<v8::Value>& args)
                 args.GetReturnValue().Set(Undefined(args.GetIsolate()));
 		return;
 	}
-	CString			instr(args[0]);
+	CString			instr(plv8_ToStringChecked(args.GetIsolate(), args[0]));
 	const char	   *result;
 
 	PG_TRY();
@@ -1809,9 +1997,9 @@ void GetMemoryInfo(v8::Local<v8::Object> obj) {
 	Local<v8::Value> used = Local<v8::Value>::New(isolate, Number::New(isolate, v8_heap_stats.used_heap_size()));
 	Local<v8::Value> external = Local<v8::Value>::New(isolate, Number::New(isolate, v8_heap_stats.external_memory()));
 
-	obj->Set(context, v8::String::NewFromUtf8(isolate, "total_heap_size").ToLocalChecked(), total).Check();
-	obj->Set(context, v8::String::NewFromUtf8(isolate, "used_heap_size").ToLocalChecked(), used).Check();
-	obj->Set(context, v8::String::NewFromUtf8(isolate, "external_memory").ToLocalChecked(), external).Check();
+	obj->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "total_heap_size").ToLocalChecked(), total).Check();
+	obj->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "used_heap_size").ToLocalChecked(), used).Check();
+	obj->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "external_memory").ToLocalChecked(), external).Check();
 }
 
 static void

@@ -672,29 +672,54 @@ plv8_info(PG_FUNCTION_ARGS)
 	infos = (char **) palloc(sizeof(char *) * size);
 	lengths = (size_t *) palloc(sizeof(size_t) * size);
 
-	for (i = 0; i < size; i++)
+	/*
+	 * JSON and its methods belong to the scripts of each context and can
+	 * throw.  An error is raised after the loop, once the V8 scopes of the
+	 * context are closed.
+	 */
+	js_error	js_err;
+	bool		js_failed = false;
+	bool		pg_failed = false;
+
+	for (i = 0; i < size && !js_failed && !pg_failed; i++)
 	{
 		Isolate 	   	   *isolate = ContextVector[i]->isolate;
 		Isolate::Scope		scope(isolate);
 		HandleScope			handle_scope(isolate);
 		Local<Context>		context = ContextVector[i]->localContext();
 		Context::Scope		context_scope(context);
-		JSONObject 			JSON;
-		Local<v8::Value>	result;
-		Local<v8::Object>   obj = v8::Object::New(isolate);
+		CurrentContextScope	current_scope(ContextVector[i]);
 
-		char 			   *username = GetUserNameFromId(ContextVector[i]->user_id, false);
+		try
+		{
+			JSONObject 			JSON;
+			Local<v8::Value>	result;
+			Local<v8::Object>   obj = v8::Object::New(isolate);
 
-		obj->Set(context, v8::String::NewFromUtf8Literal(isolate, "user"),
-           v8::String::NewFromUtf8(isolate, username).ToLocalChecked()).Check();
-		GetMemoryInfo(obj);
+			/* without an error, the role of an old context can be dropped */
+			char 			   *username = GetUserNameFromId(ContextVector[i]->user_id, true);
 
-		result = JSON.Stringify(obj);
-		CString str(result);
+			obj->CreateDataProperty(context, v8::String::NewFromUtf8Literal(isolate, "user"),
+			   v8::String::NewFromUtf8(isolate, username ? username : "?").ToLocalChecked()).Check();
+			GetMemoryInfo(obj);
 
-		infos[i] = pstrdup(str.str());
-		lengths[i] = strlen(infos[i]);
-		total_length += lengths[i] + 1; // add 1 byte for ','
+			result = JSON.Stringify(obj);
+			CString str(plv8_ToStringChecked(isolate, result));
+
+			infos[i] = pstrdup(str.str());
+			lengths[i] = strlen(infos[i]);
+			total_length += lengths[i] + 1; // add 1 byte for ','
+		}
+		catch (js_error &e) { js_err = e; js_failed = true; }
+		catch (pg_error &e) { pg_failed = true; }
+	}
+
+	if (js_failed || pg_failed)
+	{
+		MemoryContextSwitchTo(old_context);
+		if (js_failed)
+			js_err.rethrow();
+		pg_error().rethrow();
 	}
 
 	char *out = (char *) palloc0(total_length);
@@ -1142,8 +1167,10 @@ CallSRFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 		Handle<Array> array = Handle<Array>::Cast(result);
 		// return an array of records.
 		int	length = array->Length();
+		/* An element getter can throw. */
+		TryCatch	try_catch(xenv->isolate);
 		for (int i = 0; i < length; i++)
-			conv.ToDatum(array->Get(context, i).ToLocalChecked(), tupstore);
+			conv.ToDatum(plv8_ToLocal(array->Get(context, i), try_catch), tupstore);
 	}
 	else
 	{
@@ -1283,7 +1310,7 @@ CallTrigger(PG_FUNCTION_ARGS, plv8_exec_env *xenv)
 	// 9: TG_ARGV
 	Handle<Array> tgargs = Array::New(xenv->isolate, trig->tg_trigger->tgnargs);
 	for (int i = 0; i < trig->tg_trigger->tgnargs; i++)
-		tgargs->Set(context, i, ToString(trig->tg_trigger->tgargs[i])).Check();
+		tgargs->CreateDataProperty(context, i, ToString(trig->tg_trigger->tgargs[i])).Check();
 	args[9] = tgargs;
 
 	TryCatch			try_catch(xenv->isolate);
@@ -2189,7 +2216,7 @@ Converter::ToValue(HeapTuple tuple)
 
 		datum = heap_getattr(tuple, c + 1, m_tupdesc, &isnull);
 
-		obj->Set(context, m_colnames[c], ::ToValue(datum, isnull, &m_coltypes[c])).Check();
+		obj->CreateDataProperty(context, m_colnames[c], ::ToValue(datum, isnull, &m_coltypes[c])).Check();
 	}
 
 	return obj;
@@ -2225,7 +2252,7 @@ Converter::ToDatum(Handle<v8::Value> value, Tuplestorestate *tupstore)
 	{
 	if (!m_is_scalar)
 	{
-		Handle<Array> names = obj->GetPropertyNames(isolate->GetCurrentContext()).ToLocalChecked();
+		Handle<Array> names = plv8_ToLocal(obj->GetPropertyNames(isolate->GetCurrentContext()), try_catch);
 
 		for (int c = 0; c < m_tupdesc->natts; c++)
 		{
@@ -2236,7 +2263,8 @@ Converter::ToDatum(Handle<v8::Value> value, Tuplestorestate *tupstore)
 			CString  colname(m_colnames[c]);
 			for (int d = 0; d < m_tupdesc->natts; d++)
 			{
-				CString fname(names->Get(context, d).ToLocalChecked());
+				/* Past the end of names, Get() reads Array.prototype. */
+				CString fname(plv8_ToStringChecked(isolate, plv8_ToLocal(names->Get(context, d), try_catch)));
 				if (strcmp(colname, fname) == 0)
 				{
 					found = true;
@@ -2257,7 +2285,7 @@ Converter::ToDatum(Handle<v8::Value> value, Tuplestorestate *tupstore)
 			continue;
 		}
 
-		Handle<v8::Value> attr = m_is_scalar ? value : obj->Get(context, m_colnames[c]).ToLocalChecked();
+		Handle<v8::Value> attr = m_is_scalar ? value : plv8_ToLocal(obj->Get(context, m_colnames[c]), try_catch);
 		if (attr.IsEmpty() || attr->IsUndefined() || attr->IsNull())
 			nulls[c] = true;
 		else
@@ -2293,6 +2321,44 @@ Converter::ToDatum(Handle<v8::Value> value, Tuplestorestate *tupstore)
 	pfree(nulls);
 
 	return result;
+}
+
+/*
+ * Throw js_error for a V8 call that returned an empty result.
+ *
+ * Termination (the memory limit, an interrupt) has no script exception, and
+ * a call made while V8 is terminating returns empty without catching one.
+ * These get the messages that DoCall() uses.
+ */
+void
+plv8_ThrowScriptError(v8::TryCatch &try_catch)
+{
+	if (try_catch.HasTerminated() || Isolate::GetCurrent()->IsExecutionTerminating())
+	{
+		if (current_context != NULL && current_context->interrupted)
+			throw js_error("Signal caught: interrupted");
+		throw js_error("Out of memory error");
+	}
+	if (!try_catch.HasCaught())
+		throw js_error("unknown exception");
+	throw js_error(try_catch);
+}
+
+/*
+ * Copy the message strings into CurrentMemoryContext, for an error made in
+ * a memory context that is deleted before the error is reported.
+ */
+void
+js_error::copy_strings()
+{
+	if (m_msg)
+		m_msg = pstrdup(m_msg);
+	if (m_detail)
+		m_detail = pstrdup(m_detail);
+	if (m_hint)
+		m_hint = pstrdup(m_hint);
+	if (m_context)
+		m_context = pstrdup(m_context);
 }
 
 js_error::js_error() noexcept
