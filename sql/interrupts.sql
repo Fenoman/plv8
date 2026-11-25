@@ -1,0 +1,160 @@
+-- statement_timeout stops running JavaScript.  Each loop ends by itself after
+-- 10 s, so an interrupt that does not arrive fails the test instead of
+-- hanging it.  Terse errors: whether a cancel lands in SQL or in JavaScript
+-- changes only the context lines.
+\set VERBOSITY terse
+CREATE FUNCTION int_loop(ms int) RETURNS int AS $$
+  var t = Date.now();
+  while (Date.now() - t < ms) {}
+  return ms;
+$$ LANGUAGE plv8;
+SELECT int_loop(1);
+CREATE FUNCTION int_result_getter() RETURNS jsonb AS $$
+  return {get a() {
+    var t = Date.now();
+    while (Date.now() - t < 10000) {}
+    globalThis.int_getter_finished = true;
+    return 'not interrupted';
+  }};
+$$ LANGUAGE plv8;
+-- Stop if the role cannot be created, it may belong to someone else.
+\set ON_ERROR_STOP 1
+CREATE ROLE int_definer_role;
+\set ON_ERROR_STOP 0
+CREATE FUNCTION int_definer_loop() RETURNS int AS $$
+  var t = Date.now();
+  while (Date.now() - t < 10000) {}
+  return 1;
+$$ LANGUAGE plv8 SECURITY DEFINER;
+ALTER FUNCTION int_definer_loop() OWNER TO int_definer_role;
+CREATE PROCEDURE int_commit_loop() AS $$
+  plv8.commit();
+  var t = Date.now();
+  while (Date.now() - t < 10000) {}
+  plv8.elog(NOTICE, 'not interrupted');
+$$ LANGUAGE plv8;
+CREATE TABLE int_rows (x int);
+CREATE FUNCTION int_trigger_loop() RETURNS trigger AS $$
+  var t = Date.now();
+  while (Date.now() - t < 10000) {}
+  return NEW;
+$$ LANGUAGE plv8;
+CREATE TRIGGER int_trigger_loop BEFORE INSERT ON int_rows
+  FOR EACH ROW WHEN (NEW.x = 1) EXECUTE FUNCTION int_trigger_loop();
+CREATE FUNCTION int_trigger_getter() RETURNS trigger AS $$
+  return {get x() {
+    var t = Date.now();
+    while (Date.now() - t < 10000) {}
+    globalThis.int_trigger_getter_finished = true;
+    return 2;
+  }};
+$$ LANGUAGE plv8;
+CREATE TRIGGER int_trigger_getter BEFORE INSERT ON int_rows
+  FOR EACH ROW WHEN (NEW.x = 2) EXECUTE FUNCTION int_trigger_getter();
+SET statement_timeout = '200ms';
+DO $$
+  var t = Date.now();
+  while (Date.now() - t < 10000) {}
+  plv8.elog(NOTICE, 'not interrupted');
+$$ LANGUAGE plv8;
+SELECT int_loop(10000);
+SELECT int_loop(10000);
+
+-- Script code in conversions: a getter of the result, of a parameter.
+SELECT int_result_getter();
+DO $$
+  var p = [1];
+  Object.defineProperty(p, 0, {get() {
+    var t = Date.now();
+    while (Date.now() - t < 10000) {}
+    return 1;
+  }});
+  plv8.execute('SELECT $1::int', p);
+  plv8.elog(NOTICE, 'not interrupted');
+$$ LANGUAGE plv8;
+
+-- A cancel that reaches the script from SQL cannot be caught, as in PL/pgSQL.
+DO $$
+  var t = Date.now();
+  var caught = 0;
+  while (Date.now() - t < 10000) {
+    try {
+      plv8.execute('SELECT pg_sleep(0.05)');
+    } catch (e) {
+      caught++;
+    }
+  }
+  plv8.elog(NOTICE, 'not interrupted, caught ' + caught);
+$$ LANGUAGE plv8;
+DO $$
+  try {
+    plv8.subtransaction(function() {
+      var t = Date.now();
+      while (Date.now() - t < 10000) {}
+    });
+    plv8.elog(NOTICE, 'not interrupted');
+  } catch (e) {
+    plv8.elog(NOTICE, 'caught: ' + e.message);
+  }
+$$ LANGUAGE plv8;
+-- A function of another role called from a script, and a procedure that
+-- committed.
+DO $$ plv8.execute('SELECT int_definer_loop()'); $$ LANGUAGE plv8;
+CALL int_commit_loop();
+-- Source that breaks out of the function wrapper runs while it is compiled.
+DO $$
+  }), (() => { var t = Date.now(); while (Date.now() - t < 10000) {} })(), (function() {
+$$ LANGUAGE plv8;
+-- Triggers: a loop in the trigger, a getter of the row it returns.
+INSERT INTO int_rows VALUES (1);
+INSERT INTO int_rows VALUES (2);
+RESET statement_timeout;
+-- A cancel raised inside SQL that the script runs.
+DO $$
+  try {
+    plv8.execute('SELECT pg_cancel_backend(pg_backend_pid())');
+    plv8.execute('SELECT pg_sleep(10)');
+  } catch (e) {
+    plv8.elog(NOTICE, 'caught: ' + e.message);
+  }
+  plv8.elog(NOTICE, 'not interrupted');
+$$ LANGUAGE plv8;
+SELECT plv8_info() IS NOT NULL AS info;
+DROP FUNCTION int_definer_loop();
+DROP ROLE int_definer_role;
+-- The cancel stopped the getter, it did not wait for the getter to end.
+DO $$
+  plv8.elog(NOTICE, 'result getter finished: ' + (globalThis.int_getter_finished === true));
+  plv8.elog(NOTICE, 'trigger getter finished: ' + (globalThis.int_trigger_getter_finished === true));
+$$ LANGUAGE plv8;
+SELECT count(*) AS rows FROM int_rows;
+DROP TABLE int_rows;
+
+-- After an interrupt the next calls run normally.
+SELECT int_loop(1);
+DO $$
+  try {
+    throw new Error('thrown');
+  } catch (e) {
+    plv8.elog(NOTICE, 'caught: ' + e.message);
+  }
+$$ LANGUAGE plv8;
+
+-- plv8.start_proc runs when a session makes its context: its error and a
+-- cancel while it runs are reported.
+CREATE FUNCTION int_start_throws() RETURNS void AS $$
+  throw new Error('start failed');
+$$ LANGUAGE plv8;
+CREATE FUNCTION int_start_loop() RETURNS void AS $$
+  var t = Date.now();
+  while (Date.now() - t < 10000) {}
+$$ LANGUAGE plv8;
+\c
+SET plv8.start_proc = 'int_start_throws';
+SELECT int_loop(1);
+\c
+SET plv8.start_proc = 'int_start_loop';
+SET statement_timeout = '200ms';
+SELECT int_loop(1);
+RESET statement_timeout;
+RESET plv8.start_proc;

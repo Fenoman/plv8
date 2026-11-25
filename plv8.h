@@ -372,6 +372,10 @@ public:
 
 extern plv8_context* current_context;
 
+/* A query cancel that a script got from a SPI call, raised when it stops. */
+extern ErrorData *plv8_pending_cancel;
+__attribute__((noreturn)) extern void plv8_ReportInterrupt();
+
 /*
  * Points current_context at the context that is about to execute JavaScript
  * and restores the previous value when the scope ends.  Nested calls (a

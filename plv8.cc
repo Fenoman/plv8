@@ -33,12 +33,17 @@ extern "C" {
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/timeout.h"
+#include "utils/timestamp.h"
 #if PG_VERSION_NUM >= 190000
 #include "utils/hsearch.h"
 #endif
 
 #include <exception>
+#ifndef WIN32
+#include <pthread.h>
 #include <signal.h>
+#endif
 
 #ifdef EXECUTION_TIMEOUT
 #ifdef _MSC_VER
@@ -114,6 +119,7 @@ typedef struct plv8_proc_cache
 } plv8_proc_cache;
 
 plv8_context *current_context = nullptr;
+ErrorData *plv8_pending_cancel = nullptr;
 static uint64 next_context_id = 1;
 size_t plv8_memory_limit = 0;
 size_t plv8_last_heap_size = 0;
@@ -478,7 +484,21 @@ _PG_init(void)
 	V8::InitializeExternalStartupData("plv8");
 #endif
 	if (!v8_platform) {
+#ifndef WIN32
+		/*
+		 * The worker threads inherit the signal mask.  They start with all
+		 * signals blocked, so the handlers of PostgreSQL, the interrupt
+		 * check among them, run on the backend thread only.
+		 */
+		sigset_t	block_all, saved;
+
+		sigfillset(&block_all);
+		pthread_sigmask(SIG_SETMASK, &block_all, &saved);
 		v8_platform = platform::NewDefaultPlatform();
+		pthread_sigmask(SIG_SETMASK, &saved, NULL);
+#else
+		v8_platform = platform::NewDefaultPlatform();
+#endif
 	}
 
 	if (plv8_v8_flags != NULL) {
@@ -490,10 +510,146 @@ _PG_init(void)
 	V8::Initialize();
 }
 
+/*
+ * Interrupting JavaScript.
+ *
+ * Query cancel, statement_timeout and pg_terminate_backend() only set flags
+ * that CHECK_FOR_INTERRUPTS() reads, and JavaScript never gets there.  While
+ * plv8 runs, a PostgreSQL timeout checks the flags every 25 ms and stops
+ * V8.  The code that sees the stopped script then lets PostgreSQL report the
+ * interrupt (plv8_ReportInterrupt()).
+ *
+ * The timeout handler runs from SIGALRM on the backend thread (the V8 worker
+ * threads block signals).  It reads flags and current_context, and
+ * TerminateExecution() takes the recursive mutex of the isolate, as the
+ * signal handler that plv8 used before did.  A request lost to a race with
+ * V8 is made again by the next check.
+ */
+#define PLV8_INTERRUPT_CHECK_MS		25
+
+static TimeoutId plv8_interrupt_timeout = MAX_TIMEOUTS;
+
+#if PG_VERSION_NUM >= 150000
+static void
+plv8_interrupt_check(void)
+{
+	plv8_context   *context = current_context;
+
+	/*
+	 * What ProcessInterrupts() acts on.  InterruptHoldoffCount is not
+	 * checked: handle_sig_alarm() holds interrupts while it runs handlers.
+	 */
+	if (context == NULL)
+		return;
+	if ((QueryCancelPending && QueryCancelHoldoffCount == 0) || ProcDiePending
+#if PG_VERSION_NUM >= 170000
+		|| TransactionTimeoutPending
+#endif
+		)
+	{
+		context->interrupted = true;
+		context->isolate->TerminateExecution();
+	}
+}
+#endif
+
+static bool
+plv8_InterruptActive()
+{
+	return plv8_interrupt_timeout != MAX_TIMEOUTS &&
+		get_timeout_active(plv8_interrupt_timeout);
+}
+
+static void
+plv8_InterruptDisarm()
+{
+	if (plv8_interrupt_timeout != MAX_TIMEOUTS)
+		disable_timeout(plv8_interrupt_timeout, false);
+}
+
+/*
+ * Keeps the interrupt check on while plv8 runs.
+ *
+ * Only the outermost scope arms the timeout, nested ones see it active.  A
+ * PostgreSQL error that skips the destructor goes through the PG_CATCH of
+ * CallFunction(), CallSRFunction() or CallTrigger(), which disarms what the
+ * call armed.
+ *
+ * PostgreSQL before 15 has no repeating timeout, there the check is off.
+ */
+class Plv8InterruptScope
+{
+private:
+	bool		m_armed;
+
+public:
+	explicit Plv8InterruptScope(plv8_context *context) : m_armed(false)
+	{
+		/*
+		 * A call starts clean, as DoCall() does: a stop left in the isolate
+		 * is stale.  No call starts inside a script that is being stopped,
+		 * plv8_FunctionInvoker() runs no callback for it.
+		 */
+		if (context->isolate->IsExecutionTerminating())
+			context->isolate->CancelTerminateExecution();
+		context->interrupted = false;
+
+#if PG_VERSION_NUM >= 150000
+		if (plv8_interrupt_timeout == MAX_TIMEOUTS)
+			plv8_interrupt_timeout = RegisterTimeout(USER_TIMEOUT, plv8_interrupt_check);
+		if (get_timeout_active(plv8_interrupt_timeout))
+			return;
+
+		enable_timeout_every(plv8_interrupt_timeout,
+							 TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+														 PLV8_INTERRUPT_CHECK_MS),
+							 PLV8_INTERRUPT_CHECK_MS);
+		m_armed = true;
+#endif
+	}
+
+	~Plv8InterruptScope()
+	{
+		if (m_armed)
+			plv8_InterruptDisarm();
+	}
+};
+
+/*
+ * Report a script stopped by an interrupt.
+ *
+ * PostgreSQL reports the cancel or termination it has pending.  A query
+ * cancel that the script got from a SPI call (plv8_pending_cancel) is raised
+ * again, the script could not catch it.
+ */
+void
+plv8_ReportInterrupt()
+{
+	ErrorData  *cancel = plv8_pending_cancel;
+
+	plv8_pending_cancel = nullptr;
+	PG_TRY();
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (cancel != nullptr)
+			ReThrowError(cancel);
+	}
+	PG_CATCH();
+	{
+		throw pg_error();
+	}
+	PG_END_TRY();
+
+	throw js_error("Signal caught: interrupted");
+}
+
 static void
 plv8_xact_cb(XactEvent event, void *arg)
 {
 	plv8_exec_env	   *env = exec_env_head;
+
+	/* it is in TopTransactionContext */
+	plv8_pending_cancel = nullptr;
 
 	while (env)
 	{
@@ -530,10 +686,28 @@ plv8_new_exec_env(plv8_context *context)
 	return xenv;
 }
 
+/*
+ * GetPlv8Context() for an entry point outside its C++ try block.  Making a
+ * context runs plv8.start_proc, and its errors and interrupts are C++
+ * exceptions.
+ */
+static plv8_context *
+GetPlv8ContextOrError()
+{
+	try
+	{
+		return GetPlv8Context();
+	}
+	catch (js_error& e)	{ e.rethrow(); }
+	catch (pg_error& e)	{ e.rethrow(); }
+
+	return nullptr;	// keep compiler quiet
+}
+
 Datum
 plv8_call_handler(PG_FUNCTION_ARGS)
 {
-	plv8_context   *context = GetPlv8Context();
+	plv8_context   *context = GetPlv8ContextOrError();
 	Oid		fn_oid = fcinfo->flinfo->fn_oid;
 	bool	is_trigger = CALLED_AS_TRIGGER(fcinfo);
 
@@ -690,6 +864,11 @@ plv8_info(PG_FUNCTION_ARGS)
 		Context::Scope		context_scope(context);
 		CurrentContextScope	current_scope(ContextVector[i]);
 
+		/* no script runs now, a stop left in the isolate is stale */
+		if (isolate->IsExecutionTerminating())
+			isolate->CancelTerminateExecution();
+		ContextVector[i]->interrupted = false;
+
 		try
 		{
 			JSONObject 			JSON;
@@ -800,41 +979,6 @@ Breakout (void *d)
 }
 #endif
 #endif
-void *int_handler = NULL;
-void *term_handler = NULL;
-void *abt_handler = NULL;
-
-/*
- * signal handler
- *
- * This function kills the execution of the v8 process if a signal is called
- */
-void
-signal_handler (int sig) {
-	elog(DEBUG1, "cancelling execution");
-	auto running_context = GetPlv8Context();
-	running_context->interrupted = true;
-	running_context->isolate->TerminateExecution();
-
-	// call the old handler if it exists
-	switch(sig) {
-		case SIGINT:
-			if (int_handler != NULL) {
-				((void (*)(int)) int_handler)(sig);
-			}
-			break;
-		case SIGTERM:
-			if (term_handler != NULL) {
-				((void (*)(int)) term_handler)(sig);
-			}
-			break;
-		case SIGABRT:
-			if (abt_handler != NULL) {
-				((void (*)(int)) abt_handler)(sig);
-			}
-			break;
-	}
-}
 
 /*
  * DoCall -- Call a JS function with SPI support.
@@ -857,19 +1001,6 @@ DoCall(Local<Context> ctx, Handle<Function> fn, Handle<Object> receiver,
 	if (SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0) != SPI_OK_CONNECT)
 		throw js_error("could not connect to SPI manager");
 
-	// set up the signal handlers
-	if (int_handler == NULL) {
-		int_handler = (void *) signal(SIGINT, signal_handler);
-	}
-
-	if (term_handler == NULL) {
-		term_handler = (void *) signal(SIGTERM, signal_handler);
-	}
-
-	if (abt_handler == NULL) {
-		abt_handler = (void *) signal(SIGABRT, signal_handler);
-	}
-
 #ifdef EXECUTION_TIMEOUT
 	bool timeout = false;
 #ifdef _MSC_VER // windows
@@ -884,7 +1015,12 @@ DoCall(Local<Context> ctx, Handle<Function> fn, Handle<Object> receiver,
 #endif
 
 	try {
-	MaybeLocal<v8::Value> result = fn->Call(ctx, receiver, nargs, args);
+	MaybeLocal<v8::Value> result;
+	{
+		Plv8InterruptScope	interrupt_scope(current_context);
+
+		result = fn->Call(ctx, receiver, nargs, args);
+	}
 
 	int	status = SPI_finish();
 
@@ -903,20 +1039,18 @@ DoCall(Local<Context> ctx, Handle<Function> fn, Handle<Object> receiver,
 #endif
 #endif
 
-	// reset signal handlers
-	signal(SIGINT, (void (*)(int)) int_handler);
-	signal(SIGTERM, (void (*)(int)) term_handler);
-	signal(SIGABRT, (void (*)(int)) abt_handler);
+	/* An interrupt stops the call even when the script managed to return. */
+	if (current_context->interrupted) {
+		isolate->CancelTerminateExecution();
+		current_context->interrupted = false;
+		plv8_ReportInterrupt();
+	}
 
 	HandleUnhandledPromiseRejections();
 
 	if (result.IsEmpty()) {
-		if (isolate->IsExecutionTerminating() || current_context->interrupted) {
+		if (isolate->IsExecutionTerminating()) {
 			isolate->CancelTerminateExecution();
-			if (current_context->interrupted) {
-				current_context->interrupted = false;
-				throw js_error("Signal caught: interrupted");
-			}
 #ifdef EXECUTION_TIMEOUT
 			if (timeout) {
 				throw js_error("execution timeout exceeded");
@@ -967,8 +1101,12 @@ CallFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 	WindowFunctionSupport support(context, fcinfo);
 	Datum				ret = (Datum) 0;
 	std::exception_ptr	cxx_error;
+	bool				interrupt_was_active = plv8_InterruptActive();
 
 	auto call = [&]() -> Datum {
+	/* conversions run script code (getters) too */
+	Plv8InterruptScope	interrupt_scope(current_context);
+
 	/*
 	 * In window function case, we cannot see the argument datum
 	 * in fcinfo.  Instead, get them by WinGetFuncArgCurrent().
@@ -1052,6 +1190,9 @@ CallFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 	PG_CATCH();
 	{
 		support.Restore();
+		/* the error skipped the destructor of interrupt_scope */
+		if (!interrupt_was_active)
+			plv8_InterruptDisarm();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1146,8 +1287,12 @@ CallSRFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 	 */
 	SRFSupport support(context, &conv, tupstore);
 	std::exception_ptr	cxx_error;
+	bool				interrupt_was_active = plv8_InterruptActive();
 
 	auto call = [&]() {
+	/* conversions run script code (getters) too */
+	Plv8InterruptScope	interrupt_scope(current_context);
+
 	for (int i = 0; i < nargs; i++) {
 		args[i] = ToValue(fcinfo->args[i].value, fcinfo->args[i].isnull, &argtypes[i]);
 	}
@@ -1198,6 +1343,9 @@ CallSRFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 	PG_CATCH();
 	{
 		support.Restore();
+		/* the error skipped the destructor of interrupt_scope */
+		if (!interrupt_was_active)
+			plv8_InterruptDisarm();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1208,7 +1356,7 @@ CallSRFunction(PG_FUNCTION_ARGS, plv8_exec_env *xenv,
 }
 
 static Datum
-CallTrigger(PG_FUNCTION_ARGS, plv8_exec_env *xenv)
+CallTriggerBody(PG_FUNCTION_ARGS, plv8_exec_env *xenv)
 {
 	// trigger arguments are:
 	//	0: NEW
@@ -1233,6 +1381,8 @@ CallTrigger(PG_FUNCTION_ARGS, plv8_exec_env *xenv)
 
 	Handle<Context>		context = xenv->localContext();
 	Context::Scope		context_scope(context);
+	/* converting the returned row runs script code (getters) too */
+	Plv8InterruptScope	interrupt_scope(current_context);
 
 	if (TRIGGER_FIRED_FOR_ROW(event))
 	{
@@ -1347,10 +1497,42 @@ CallTrigger(PG_FUNCTION_ARGS, plv8_exec_env *xenv)
 	return result;
 }
 
+static Datum
+CallTrigger(PG_FUNCTION_ARGS, plv8_exec_env *xenv)
+{
+	bool				interrupt_was_active = plv8_InterruptActive();
+	Datum				ret = (Datum) 0;
+	std::exception_ptr	cxx_error;
+
+	/* As in CallFunction(), a PostgreSQL error skips the scope destructors. */
+	PG_TRY();
+	{
+		try
+		{
+			ret = CallTriggerBody(fcinfo, xenv);
+		}
+		catch (...)
+		{
+			cxx_error = std::current_exception();
+		}
+	}
+	PG_CATCH();
+	{
+		if (!interrupt_was_active)
+			plv8_InterruptDisarm();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (cxx_error)
+		std::rethrow_exception(cxx_error);
+	return ret;
+}
+
 Datum
 plv8_call_validator(PG_FUNCTION_ARGS)
 {
-	plv8_context   *context = GetPlv8Context();
+	plv8_context   *context = GetPlv8ContextOrError();
 	Oid				fn_oid = PG_GETARG_OID(0);
 	HeapTuple		tuple;
 	Form_pg_proc	proc;
@@ -1716,15 +1898,6 @@ CompileFunction(
 	TryCatch		try_catch(isolate);
 	v8::ScriptOrigin origin(isolate, name);
 
-	// set up the signal handlers
-	if (int_handler == NULL) {
-		int_handler = (void *) signal(SIGINT, signal_handler);
-	}
-
-	if (term_handler == NULL) {
-		term_handler = (void *) signal(SIGTERM, signal_handler);
-	}
-
 #ifdef EXECUTION_TIMEOUT
 	bool timeout = false;
 #ifdef _MSC_VER // windows
@@ -1744,10 +1917,15 @@ CompileFunction(
 		isolate->CancelTerminateExecution();
 		current_context->interrupted = false;
 	}
-	if (Script::Compile(isolate->GetCurrentContext(), source, &origin).ToLocal(&script)) {
-		if (!script.IsEmpty()) {
-			if (!script->Run(isolate->GetCurrentContext()).ToLocal(&result))
-				throw js_error(try_catch);
+	{
+		/* the source can break out of the function wrapper and run code */
+		Plv8InterruptScope	interrupt_scope(global_context);
+
+		if (Script::Compile(isolate->GetCurrentContext(), source, &origin).ToLocal(&script)) {
+			if (!script.IsEmpty()) {
+				if (!script->Run(isolate->GetCurrentContext()).ToLocal(&result))
+					plv8_ThrowScriptError(try_catch);
+			}
 		}
 	}
 
@@ -1765,8 +1943,6 @@ CompileFunction(
 	}
 #endif
 #endif
-	signal(SIGINT, (void (*)(int)) int_handler);
-	signal(SIGTERM, (void (*)(int)) term_handler);
 
 	HandleUnhandledPromiseRejections();
 
@@ -1775,7 +1951,7 @@ CompileFunction(
 			isolate->CancelTerminateExecution();
 			if (current_context->interrupted) {
 				current_context->interrupted = false;
-				throw js_error("Signal caught: interrupted");
+				plv8_ReportInterrupt();
 			}
 #ifdef EXECUTION_TIMEOUT
 			if (timeout) {
@@ -2336,7 +2512,7 @@ plv8_ThrowScriptError(v8::TryCatch &try_catch)
 	if (try_catch.HasTerminated() || Isolate::GetCurrent()->IsExecutionTerminating())
 	{
 		if (current_context != NULL && current_context->interrupted)
-			throw js_error("Signal caught: interrupted");
+			plv8_ReportInterrupt();
 		throw js_error("Out of memory error");
 	}
 	if (!try_catch.HasCaught())

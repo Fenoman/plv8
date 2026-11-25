@@ -239,7 +239,7 @@ JSONObject::Parse(Handle<v8::Value> str)
 
 	MaybeLocal<v8::Value> value = parse_func->Call(context, m_json, 1, &str);
 	if (value.IsEmpty())
-		throw js_error(try_catch);
+		plv8_ThrowScriptError(try_catch);
 	return value.ToLocalChecked();
 }
 
@@ -260,7 +260,7 @@ JSONObject::Stringify(Handle<v8::Value> val)
 
 	MaybeLocal<v8::Value> value = stringify_func->Call(isolate->GetCurrentContext(), m_json, 1, &val);
 	if (value.IsEmpty())
-		throw js_error(try_catch);
+		plv8_ThrowScriptError(try_catch);
 	return value.ToLocalChecked();
 }
 
@@ -350,6 +350,15 @@ plv8_FunctionInvoker(const FunctionCallbackInfo<v8::Value> &args) throw()
 	 * context.
 	 */
 	CurrentContextScope	context_scope(current_context);
+	plv8_context	   *self_context = current_context;
+
+	/*
+	 * The script is being stopped: run nothing more for it.  V8 notices the
+	 * stop at its next interrupt check, which can be several loop iterations
+	 * later, and the calls in between must not run SQL.
+	 */
+	if (current_context != nullptr && current_context->interrupted)
+		return;
 
 	try
 	{
@@ -357,10 +366,18 @@ plv8_FunctionInvoker(const FunctionCallbackInfo<v8::Value> &args) throw()
 	}
 	catch (js_error& e)
 	{
-		args.GetReturnValue().Set(isolate->ThrowException(e.error_object()));
+		/* a nested call that failed may not have switched it back */
+		current_context = self_context;
+		/*
+		 * ThrowException() would replace a requested stop with an exception
+		 * that the script can catch, so leave the stop alone.
+		 */
+		if (current_context == nullptr || !current_context->interrupted)
+			args.GetReturnValue().Set(isolate->ThrowException(e.error_object()));
 	}
 	catch (pg_error& e)
 	{
+		current_context = self_context;
 		MemoryContextSwitchTo(ctx);
 		ErrorData *edata = CopyErrorData();
 
@@ -387,8 +404,28 @@ plv8_FunctionInvoker(const FunctionCallbackInfo<v8::Value> &args) throw()
 			Handle<Primitive>(ToString(edata->internalquery)) : Null(isolate);
 		Handle<v8::Integer> code = Uint32::New(isolate, edata->sqlerrcode);
 
+		/*
+		 * As in PL/pgSQL, a script cannot catch a query cancel: stop the
+		 * script, the cancel is raised again when it has stopped.
+		 */
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED && current_context != nullptr)
+		{
+			MemoryContext	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+
+			if (plv8_pending_cancel != nullptr)
+				FreeErrorData(plv8_pending_cancel);
+			plv8_pending_cancel = CopyErrorData();
+			MemoryContextSwitchTo(oldcontext);
+			current_context->interrupted = true;
+			isolate->TerminateExecution();
+		}
+
 		FlushErrorState();
 		FreeErrorData(edata);
+
+		/* the script is being stopped, see the js_error case */
+		if (current_context != nullptr && current_context->interrupted)
+			return;
 
 		Handle<v8::Object> err = Exception::Error(message)->ToObject(isolate->GetCurrentContext()).ToLocalChecked();
 		err->CreateDataProperty(context, v8::String::NewFromUtf8(isolate, "sqlerrcode").ToLocalChecked(), sqlerrcode).Check();
@@ -572,6 +609,7 @@ value_get_param(Handle<Array> params, int i)
 	Handle<v8::Value>	param;
 	js_error	js_err;
 	bool		js_failed = false;
+	bool		pg_failed = false;
 
 	try
 	{
@@ -580,9 +618,12 @@ value_get_param(Handle<Array> params, int i)
 		param = plv8_ToLocal(params->Get(isolate->GetCurrentContext(), i), try_catch);
 	}
 	catch (js_error& e) { js_err = e; js_failed = true; }
+	catch (pg_error& e) { pg_failed = true; }	/* an interrupt */
 
 	if (js_failed)
 		js_err.rethrow();
+	if (pg_failed)
+		pg_error().rethrow();
 	return param;
 }
 
@@ -1343,7 +1384,7 @@ plv8_Subtransaction(const FunctionCallbackInfo<v8::Value>& args)
 	PG_END_TRY();
 
 	if (result.IsEmpty())
-		throw js_error(try_catch);
+		plv8_ThrowScriptError(try_catch);
 	args.GetReturnValue().Set(result.ToLocalChecked());
 }
 

@@ -131,6 +131,10 @@ distclean: clean
 .PHONY: subclean all clean installcheck
 
 include $(PGXS)
+# Stopping running JavaScript needs the repeating timeouts of PostgreSQL 15.
+ifeq ($(shell test $(MAJORVERSION) -ge 15 && echo yes),yes)
+REGRESS += interrupts
+endif
 # PGXS links MODULE_big with $(CC); point it at the C++ compiler.
 CC=$(CXX)
 # Do not leak the PGXS toolchain settings into the v8-cmake build.  Packaging
